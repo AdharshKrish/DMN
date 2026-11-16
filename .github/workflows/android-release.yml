@@ -29,6 +29,17 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Accept Android SDK licenses
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          fi
+
       - name: Prepare debug keystore
         run: |
           if [ -f debug.keystore.base64 ]; then
@@ -45,10 +56,10 @@ jobs:
           gradle-version: '9.3.1'
 
       - name: Run unit & Robolectric tests
-        run: gradle :app:testDebugUnitTest --no-daemon
+        run: gradle :app:testDebugUnitTest --no-daemon --max-workers=2 --stacktrace
 
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon
+        run: gradle :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
 
       - name: Check Release Keystore secrets
         id: check_signing
@@ -72,7 +83,7 @@ jobs:
           KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
         run: |
           echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
-          gradle :app:assembleRelease :app:bundleRelease --no-daemon
+          gradle :app:assembleRelease :app:bundleRelease --no-daemon --max-workers=2 --stacktrace
 
       - name: Collect release artifacts
         run: |
