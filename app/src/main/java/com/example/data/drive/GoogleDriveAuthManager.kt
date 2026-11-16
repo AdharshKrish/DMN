@@ -3,6 +3,8 @@ package com.example.data.drive
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.result.IntentSenderRequest
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
@@ -17,6 +19,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.security.MessageDigest
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -26,16 +29,44 @@ sealed interface DriveAuthOutcome {
     data class Failed(val message: String) : DriveAuthOutcome
 }
 
+data class AppSigningDiagnostics(
+    val packageName: String,
+    val sha1Fingerprint: String?
+)
+
 class GoogleDriveAuthManager(private val context: Context) {
 
     private val httpClient = OkHttpClient()
 
     companion object {
         private val DRIVE_SCOPES = listOf(
+            Scope("openid"),
             Scope("https://www.googleapis.com/auth/drive"),
             Scope("https://www.googleapis.com/auth/userinfo.email")
         )
+
+        fun readSigningDiagnostics(context: Context): AppSigningDiagnostics {
+            val pkg = context.packageName
+            val sha1 = runCatching {
+                val pm = context.packageManager
+                val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES)
+                        .signingInfo
+                        ?.apkContentsSigners
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES).signatures
+                }
+                val certBytes = signatures?.firstOrNull()?.toByteArray() ?: return@runCatching null
+                MessageDigest.getInstance("SHA-1")
+                    .digest(certBytes)
+                    .joinToString(":") { "%02X".format(it) }
+            }.getOrNull()
+            return AppSigningDiagnostics(packageName = pkg, sha1Fingerprint = sha1)
+        }
     }
+
+    fun getAppSigningDiagnostics(): AppSigningDiagnostics = readSigningDiagnostics(context)
 
     suspend fun authorizeDrive(activity: Activity? = null): DriveAuthOutcome {
         return try {
@@ -119,12 +150,20 @@ class GoogleDriveAuthManager(private val context: Context) {
         }.getOrNull()
     }
 
-    private fun mapGoogleAuthError(e: ApiException): String {
+    internal fun mapGoogleAuthError(e: ApiException): String {
         val code = e.statusCode
-        return when (code) {
-            10 -> "OAuth client not yet configured for this app's package & SHA-1 in Google Cloud Console (Code 10: DEVELOPER_ERROR)."
-            12501 -> "Google Drive sign-in was cancelled."
-            7 -> "Network unavailable while contacting Google Identity."
+        val raw = e.message.orEmpty()
+        val isUnregistered = code == 10 ||
+            raw.contains("UNREGISTERED_ON_API_CONSOLE", ignoreCase = true) ||
+            raw.contains("DEVELOPER_ERROR", ignoreCase = true)
+        return when {
+            isUnregistered ->
+                "This APK's package name and SHA-1 are not registered on Google Cloud Console yet " +
+                    "(Code $code: UNREGISTERED_ON_API_CONSOLE). Use the Package Name & SHA-1 below to create an Android OAuth 2.0 Client ID."
+            code == 12500 ->
+                "Google Drive sign-in failed (Code 12500). Verify that Google Drive API is enabled, the OAuth consent screen is configured, and your Google account is listed under Test users."
+            code == 12501 -> "Google Drive sign-in was cancelled."
+            code == 7 -> "Network unavailable while contacting Google Identity."
             else -> "Google sign-in error (code $code): ${e.localizedMessage ?: "Unknown error"}"
         }
     }

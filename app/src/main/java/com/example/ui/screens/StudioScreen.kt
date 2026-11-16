@@ -36,11 +36,15 @@ import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.outlined.Article
 import androidx.compose.material.icons.outlined.AudioFile
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material3.Button
@@ -48,6 +52,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -61,6 +66,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,6 +77,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -81,6 +88,7 @@ import com.example.audio.RecordingState
 import com.example.data.local.JobStatus
 import com.example.data.local.ProcessingJobEntity
 import com.example.data.vault.InboxAudioFile
+import com.example.data.vault.InboxTextFile
 import com.example.ui.components.SetupChecklistCard
 import com.example.ui.components.StatusPill
 import com.example.ui.components.formatBytes
@@ -88,6 +96,8 @@ import com.example.ui.components.formatDurationMs
 import com.example.ui.components.formatRelativeTimestamp
 import com.example.ui.theme.LocalSynapseColors
 import com.example.ui.viewmodel.MainUiState
+
+private enum class StudioCaptureMode { VOICE, TEXT }
 
 @Composable
 fun StudioScreen(
@@ -99,9 +109,11 @@ fun StudioScreen(
     onResumeRecording: () -> Unit,
     onStopAndSaveRecording: () -> Unit,
     onDiscardRecording: () -> Unit,
+    onSubmitTextNote: (rawText: String, title: String, extension: String, processImmediately: Boolean) -> Unit,
     onProcessAllNow: () -> Unit,
     onProcessSingle: (String) -> Unit,
     onDeleteInboxAudio: (InboxAudioFile) -> Unit,
+    onDeleteInboxText: (InboxTextFile) -> Unit,
     onRefreshInbox: () -> Unit,
     onOpenNote: (String) -> Unit,
     onClearCompletedJobs: () -> Unit,
@@ -109,7 +121,11 @@ fun StudioScreen(
 ) {
     val context = LocalContext.current
     val sem = LocalSynapseColors.current
+    var captureMode by rememberSaveable { mutableStateOf(StudioCaptureMode.VOICE) }
     var sessionLabel by remember { mutableStateOf("DMN") }
+    var textTitle by rememberSaveable { mutableStateOf("") }
+    var textBody by rememberSaveable { mutableStateOf("") }
+    var textExtension by rememberSaveable { mutableStateOf("txt") }
     var permissionDeniedNotice by remember { mutableStateOf(false) }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -156,7 +172,7 @@ fun StudioScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "DMN Voice Studio",
+                        text = "DMN Capture Studio",
                         style = MaterialTheme.typography.headlineMedium,
                         color = MaterialTheme.colorScheme.onBackground
                     )
@@ -183,7 +199,7 @@ fun StudioScreen(
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Refresh,
-                        contentDescription = "Scan 00_Audio_Inbox"
+                        contentDescription = "Scan Audio & Text Inbox"
                     )
                 }
             }
@@ -198,30 +214,62 @@ fun StudioScreen(
         }
 
         item {
-            VoiceRecorderHeroCard(
-                recordingState = state.recordingState,
-                elapsedMs = state.recordingElapsedMs,
-                amplitudes = state.recordingAmplitudes,
-                sessionLabel = sessionLabel,
-                onSessionLabelChange = { sessionLabel = it },
-                vaultConfigured = state.settings.isVaultConfigured,
-                permissionDeniedNotice = permissionDeniedNotice,
-                onRecordTap = {
-                    val hasMic = ContextCompat.checkSelfPermission(
-                        context,
-                        Manifest.permission.RECORD_AUDIO
-                    ) == PackageManager.PERMISSION_GRANTED
-                    if (hasMic) {
-                        onStartRecording(sessionLabel)
-                    } else {
-                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                },
-                onPause = onPauseRecording,
-                onResume = onResumeRecording,
-                onStopAndSave = onStopAndSaveRecording,
-                onDiscard = onDiscardRecording
+            CaptureModeSelector(
+                selectedMode = captureMode,
+                enabled = state.recordingState == RecordingState.IDLE,
+                onSelectMode = { captureMode = it }
             )
+        }
+
+        item {
+            if (captureMode == StudioCaptureMode.VOICE) {
+                VoiceRecorderHeroCard(
+                    recordingState = state.recordingState,
+                    elapsedMs = state.recordingElapsedMs,
+                    amplitudes = state.recordingAmplitudes,
+                    sessionLabel = sessionLabel,
+                    onSessionLabelChange = { sessionLabel = it },
+                    vaultConfigured = state.settings.isVaultConfigured,
+                    permissionDeniedNotice = permissionDeniedNotice,
+                    onRecordTap = {
+                        val hasMic = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (hasMic) {
+                            onStartRecording(sessionLabel)
+                        } else {
+                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    },
+                    onPause = onPauseRecording,
+                    onResume = onResumeRecording,
+                    onStopAndSave = onStopAndSaveRecording,
+                    onDiscard = onDiscardRecording
+                )
+            } else {
+                TextNoteComposerCard(
+                    title = textTitle,
+                    onTitleChange = { textTitle = it },
+                    rawText = textBody,
+                    onRawTextChange = { textBody = it },
+                    extension = textExtension,
+                    onExtensionChange = { textExtension = it },
+                    vaultConfigured = state.settings.isVaultConfigured,
+                    geminiConfigured = state.settings.isGeminiConfigured,
+                    isProcessing = state.isProcessingAudio,
+                    onSaveToQueue = {
+                        onSubmitTextNote(textBody, textTitle, textExtension, false)
+                        textTitle = ""
+                        textBody = ""
+                    },
+                    onSynthesizeNow = {
+                        onSubmitTextNote(textBody, textTitle, textExtension, true)
+                        textTitle = ""
+                        textBody = ""
+                    }
+                )
+            }
         }
 
         item {
@@ -260,26 +308,27 @@ fun StudioScreen(
         }
 
         item {
+            val totalPending = state.inboxFiles.size + state.inboxTextFiles.size
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                     Text(
-                        text = "00_Audio_Inbox (${state.inboxFiles.size})",
+                        text = "Inbox Queue ($totalPending)",
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.onBackground
                     )
                     Text(
-                        text = "Obsidian & in-app recordings queued for Gemini synthesis",
+                        text = "00_Audio_Inbox (${state.inboxFiles.size}) & 04_Text_Inbox (${state.inboxTextFiles.size})",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Button(
                     onClick = onProcessAllNow,
-                    enabled = state.inboxFiles.isNotEmpty() && !state.isProcessingAudio &&
+                    enabled = totalPending > 0 && !state.isProcessingAudio &&
                         state.settings.isVaultConfigured && state.settings.isGeminiConfigured,
                     modifier = Modifier.testTag("process_all_button")
                 ) {
@@ -294,7 +343,7 @@ fun StudioScreen(
             }
         }
 
-        if (state.inboxFiles.isEmpty()) {
+        if (state.inboxFiles.isEmpty() && state.inboxTextFiles.isEmpty()) {
             item {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -314,9 +363,9 @@ fun StudioScreen(
                         )
                         Text(
                             text = if (state.settings.isVaultConfigured) {
-                                "00_Audio_Inbox is clear. Tap Record above or record inside Obsidian to queue a new DMN session."
+                                "Inbox is clear. Record audio, paste/type a transcript above, or drop files into 00_Audio_Inbox / 04_Text_Inbox."
                             } else {
-                                "Pick your ObsidianVault folder to inspect 00_Audio_Inbox recordings."
+                                "Pick your ObsidianVault folder to inspect queued audio and text inputs."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -325,12 +374,20 @@ fun StudioScreen(
                 }
             }
         } else {
-            items(state.inboxFiles, key = { it.uri.toString() }) { audio ->
+            items(state.inboxFiles, key = { "audio_${it.uri}" }) { audio ->
                 InboxAudioCard(
                     audio = audio,
                     canProcess = !state.isProcessingAudio && state.settings.isGeminiConfigured,
                     onProcess = { onProcessSingle(audio.uri.toString()) },
                     onDelete = { onDeleteInboxAudio(audio) }
+                )
+            }
+            items(state.inboxTextFiles, key = { "text_${it.uri}" }) { textFile ->
+                InboxTextCard(
+                    textFile = textFile,
+                    canProcess = !state.isProcessingAudio && state.settings.isGeminiConfigured,
+                    onProcess = { onProcessSingle(textFile.uri.toString()) },
+                    onDelete = { onDeleteInboxText(textFile) }
                 )
             }
         }
@@ -624,6 +681,310 @@ private fun InboxAudioCard(
                 onClick = onProcess,
                 enabled = canProcess,
                 modifier = Modifier.testTag("process_audio_${audio.name}")
+            ) {
+                Text("Process")
+            }
+        }
+    }
+}
+
+@Composable
+private fun CaptureModeSelector(
+    selectedMode: StudioCaptureMode,
+    enabled: Boolean,
+    onSelectMode: (StudioCaptureMode) -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            val isVoice = selectedMode == StudioCaptureMode.VOICE
+            Surface(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(MaterialTheme.shapes.medium)
+                    .clickable(enabled = enabled) { onSelectMode(StudioCaptureMode.VOICE) }
+                    .testTag("mode_voice_tab"),
+                shape = MaterialTheme.shapes.medium,
+                color = if (isVoice) MaterialTheme.colorScheme.primaryContainer else Color.Transparent
+            ) {
+                Row(
+                    modifier = Modifier.padding(vertical = 12.dp, horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Mic,
+                        contentDescription = null,
+                        tint = if (isVoice) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Voice Session",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (isVoice) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            val isText = selectedMode == StudioCaptureMode.TEXT
+            Surface(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(MaterialTheme.shapes.medium)
+                    .clickable(enabled = enabled) { onSelectMode(StudioCaptureMode.TEXT) }
+                    .testTag("mode_text_tab"),
+                shape = MaterialTheme.shapes.medium,
+                color = if (isText) MaterialTheme.colorScheme.primaryContainer else Color.Transparent
+            ) {
+                Row(
+                    modifier = Modifier.padding(vertical = 12.dp, horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.EditNote,
+                        contentDescription = null,
+                        tint = if (isText) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Text / Transcript",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (isText) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TextNoteComposerCard(
+    title: String,
+    onTitleChange: (String) -> Unit,
+    rawText: String,
+    onRawTextChange: (String) -> Unit,
+    extension: String,
+    onExtensionChange: (String) -> Unit,
+    vaultConfigured: Boolean,
+    geminiConfigured: Boolean,
+    isProcessing: Boolean,
+    onSaveToQueue: () -> Unit,
+    onSynthesizeNow: () -> Unit
+) {
+    val sem = LocalSynapseColors.current
+    val clipboard = LocalClipboardManager.current
+    val wordCount = remember(rawText) {
+        if (rawText.isBlank()) 0 else rawText.trim().split(Regex("""\s+""")).size
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        border = BorderStroke(1.5.dp, sem.cardBorder)
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                StatusPill(
+                    label = "Exact Copy Preserved in Archive",
+                    color = sem.insightPurple,
+                    containerColor = sem.insightPurpleContainer
+                )
+                Text(
+                    text = "$wordCount words",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            OutlinedTextField(
+                value = title,
+                onValueChange = onTitleChange,
+                label = { Text("Note / Transcript Title (optional)") },
+                placeholder = { Text("e.g., Morning_Walk_Thoughts") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("text_title_input")
+            )
+
+            OutlinedTextField(
+                value = rawText,
+                onValueChange = onRawTextChange,
+                label = { Text("Paste transcript or write thoughts directly") },
+                placeholder = { Text("Paste any external transcript or type raw thoughts here. Exact unmodified text is archived in 98_Transcript_Archive/ while Gemini builds your DMN graph links...") },
+                minLines = 6,
+                maxLines = 12,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("text_note_input")
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = extension == "txt",
+                        onClick = { onExtensionChange("txt") },
+                        label = { Text(".txt") },
+                        modifier = Modifier.testTag("text_ext_txt")
+                    )
+                    FilterChip(
+                        selected = extension == "md",
+                        onClick = { onExtensionChange("md") },
+                        label = { Text(".md") },
+                        modifier = Modifier.testTag("text_ext_md")
+                    )
+                }
+
+                TextButton(
+                    onClick = {
+                        val pasted = clipboard.getText()?.text
+                        if (!pasted.isNullOrEmpty()) {
+                            onRawTextChange(if (rawText.isBlank()) pasted else "$rawText\n$pasted")
+                        }
+                    },
+                    modifier = Modifier.testTag("paste_clipboard_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.ContentPaste,
+                        contentDescription = "Paste from clipboard",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Paste")
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onSaveToQueue,
+                    enabled = vaultConfigured && rawText.isNotBlank() && !isProcessing,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(50.dp)
+                        .testTag("save_text_queue_button")
+                ) {
+                    Text("Save to Queue")
+                }
+
+                Button(
+                    onClick = onSynthesizeNow,
+                    enabled = vaultConfigured && geminiConfigured && rawText.isNotBlank() && !isProcessing,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(50.dp)
+                        .testTag("synthesize_text_now_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(if (vaultConfigured) "Synthesize" else "Select Vault")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InboxTextCard(
+    textFile: InboxTextFile,
+    canProcess: Boolean,
+    onProcess: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val sem = LocalSynapseColors.current
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(sem.insightPurpleContainer),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Article,
+                    contentDescription = null,
+                    tint = sem.insightPurple
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = textFile.name,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (textFile.previewText.isNotBlank()) {
+                    Text(
+                        text = textFile.previewText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Text(
+                    text = "${formatBytes(textFile.sizeBytes)} • ${formatRelativeTimestamp(textFile.lastModifiedMs)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier.testTag("delete_text_${textFile.name}")
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.DeleteOutline,
+                    contentDescription = "Delete text note",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            FilledTonalButton(
+                onClick = onProcess,
+                enabled = canProcess,
+                modifier = Modifier.testTag("process_text_${textFile.name}")
             ) {
                 Text("Process")
             }

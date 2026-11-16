@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -32,7 +33,8 @@ data class VaultSettings(
     val syncWifiOnly: Boolean = false,
     val conflictStrategy: ConflictStrategy = ConflictStrategy.KEEP_NEWER,
     val lastDriveSyncMs: Long = 0L,
-    val darkTheme: Boolean = true
+    val darkTheme: Boolean = true,
+    val audioRetentionDays: Int = DEFAULT_AUDIO_RETENTION_DAYS
 ) {
     val isVaultConfigured: Boolean get() = !vaultTreeUri.isNullOrBlank()
     val isGeminiConfigured: Boolean get() = geminiApiKey.isNotBlank()
@@ -40,6 +42,7 @@ data class VaultSettings(
 
     companion object {
         const val DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+        const val DEFAULT_AUDIO_RETENTION_DAYS = 0 // 0 = Keep Forever
     }
 }
 
@@ -59,6 +62,7 @@ class VaultSettingsRepository(private val context: Context) {
         val CONFLICT_STRATEGY = stringPreferencesKey("conflict_strategy")
         val LAST_DRIVE_SYNC_MS = longPreferencesKey("last_drive_sync_ms")
         val DARK_THEME = booleanPreferencesKey("dark_theme")
+        val AUDIO_RETENTION_DAYS = intPreferencesKey("audio_retention_days")
     }
 
     val settingsFlow: Flow<VaultSettings> = context.vaultDataStore.data.map { prefs ->
@@ -79,7 +83,8 @@ class VaultSettingsRepository(private val context: Context) {
             syncWifiOnly = prefs[Keys.SYNC_WIFI_ONLY] ?: false,
             conflictStrategy = strategy,
             lastDriveSyncMs = prefs[Keys.LAST_DRIVE_SYNC_MS] ?: 0L,
-            darkTheme = prefs[Keys.DARK_THEME] ?: true
+            darkTheme = prefs[Keys.DARK_THEME] ?: true,
+            audioRetentionDays = (prefs[Keys.AUDIO_RETENTION_DAYS] ?: VaultSettings.DEFAULT_AUDIO_RETENTION_DAYS).coerceAtLeast(0)
         )
     }
 
@@ -142,5 +147,9 @@ class VaultSettingsRepository(private val context: Context) {
 
     suspend fun setDarkTheme(dark: Boolean) {
         context.vaultDataStore.edit { it[Keys.DARK_THEME] = dark }
+    }
+
+    suspend fun setAudioRetentionDays(days: Int) {
+        context.vaultDataStore.edit { it[Keys.AUDIO_RETENTION_DAYS] = days.coerceAtLeast(0) }
     }
 }

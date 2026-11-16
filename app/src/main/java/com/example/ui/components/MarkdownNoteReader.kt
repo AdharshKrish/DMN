@@ -22,9 +22,11 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.AudioFile
+import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -59,6 +61,7 @@ import com.example.ui.theme.LocalSynapseColors
 
 private val WIKILINK_INLINE_REGEX = Regex("""\[\[([^\[\]|#]+)(?:#([^\[\]|]+))?(?:\|([^\[\]]+))?]]""")
 private val AUDIO_EMBED_LINE_REGEX = Regex("""!\[\[(?:99_Audio_Archive/)?([^\]|]+\.(?:m4a|mp3|wav|webm|ogg|aac))]]""", RegexOption.IGNORE_CASE)
+private val TRANSCRIPT_EMBED_LINE_REGEX = Regex("""!\[\[(?:98_Transcript_Archive/)?([^\]|]+\.(?:txt|md))]]""", RegexOption.IGNORE_CASE)
 private val BOLD_INLINE_REGEX = Regex("""\*\*(.+?)\*\*""")
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -71,6 +74,7 @@ fun MarkdownNoteReader(
     onWikiLinkClick: (String) -> Unit,
     onToggleTask: (lineIndex: Int) -> Unit,
     onTogglePlayAudio: (audioName: String) -> Unit,
+    onOpenTranscript: (transcriptName: String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val sem = LocalSynapseColors.current
@@ -159,6 +163,7 @@ fun MarkdownNoteReader(
                 val trimmed = rawLine.trim()
 
                 val audioMatch = AUDIO_EMBED_LINE_REGEX.find(trimmed)
+                val transcriptMatch = TRANSCRIPT_EMBED_LINE_REGEX.find(trimmed)
                 when {
                     audioMatch != null -> {
                         val audioName = audioMatch.groupValues[1].trim()
@@ -166,6 +171,14 @@ fun MarkdownNoteReader(
                             audioName = audioName,
                             playbackState = playbackState,
                             onTogglePlay = { onTogglePlayAudio(audioName) }
+                        )
+                    }
+
+                    transcriptMatch != null -> {
+                        val transcriptName = transcriptMatch.groupValues[1].trim()
+                        EmbeddedTranscriptCard(
+                            transcriptName = transcriptName,
+                            onOpen = { onOpenTranscript(transcriptName) }
                         )
                     }
 
@@ -473,6 +486,63 @@ private fun EmbeddedAudioPlayerCard(
                     color = sem.amber
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun EmbeddedTranscriptCard(
+    transcriptName: String,
+    onOpen: () -> Unit
+) {
+    val sem = LocalSynapseColors.current
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpen)
+            .testTag("open_embedded_transcript_button"),
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        border = BorderStroke(1.dp, sem.insightPurple.copy(alpha = 0.45f))
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(sem.insightPurpleContainer),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Description,
+                    contentDescription = "Open exact transcript",
+                    tint = sem.insightPurple
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Exact Verbatim Archive",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = sem.insightPurple
+                )
+                Text(
+                    text = transcriptName,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.OpenInNew,
+                contentDescription = "Open transcript",
+                tint = sem.insightPurple,
+                modifier = Modifier.size(18.dp)
+            )
         }
     }
 }

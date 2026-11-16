@@ -1,7 +1,12 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -21,8 +26,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.outlined.Article
+import androidx.compose.material.icons.outlined.AudioFile
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.TaskAlt
@@ -35,6 +49,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
@@ -45,14 +60,21 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.audio.AudioPlaybackState
+import com.example.data.vault.ArchivedAudioItem
+import com.example.data.vault.ArchivedTranscript
 import com.example.data.vault.ObsidianVaultRepository
 import com.example.data.vault.VaultNote
 import com.example.ui.components.MarkdownNoteReader
 import com.example.ui.components.StatusPill
+import com.example.ui.components.formatBytes
 import com.example.ui.components.formatRelativeTimestamp
+import com.example.ui.theme.JetBrainsMonoFontFamily
 import com.example.ui.theme.LocalSynapseColors
 import com.example.ui.viewmodel.MainUiState
 
@@ -60,13 +82,16 @@ enum class VaultFilter(val label: String) {
     ALL("All Notes"),
     DAILY("Daily DMN"),
     ATOMIC("Atomic Nodes"),
-    TASKS("Open Tasks")
+    TASKS("Open Tasks"),
+    ARCHIVES("Archives")
 }
 
 @Composable
 fun VaultScreen(
     state: MainUiState,
     onSelectNote: (String?) -> Unit,
+    onSelectTranscript: (String?) -> Unit,
+    onOpenTranscriptByName: (String) -> Unit,
     onOpenNoteByTitle: (String) -> Boolean,
     onCreateAtomicNote: (String) -> Unit,
     onToggleTask: (relativePath: String, lineIndex: Int) -> Unit,
@@ -78,21 +103,40 @@ fun VaultScreen(
     var missingLinkPrompt by remember { mutableStateOf<String?>(null) }
 
     val sortedNotes = remember(state.graphData.notesByPath, searchQuery, filter) {
-        state.graphData.notesByPath.values
-            .filter { note ->
-                val matchesFilter = when (filter) {
-                    VaultFilter.ALL -> true
-                    VaultFilter.DAILY -> note.folderType == ObsidianVaultRepository.DIR_DAILY_NOTES
-                    VaultFilter.ATOMIC -> note.folderType == ObsidianVaultRepository.DIR_ATOMIC_NODES
-                    VaultFilter.TASKS -> note.pendingTasks > 0
+        if (filter == VaultFilter.ARCHIVES) {
+            emptyList()
+        } else {
+            state.graphData.notesByPath.values
+                .filter { note ->
+                    val matchesFilter = when (filter) {
+                        VaultFilter.ALL -> true
+                        VaultFilter.DAILY -> note.folderType == ObsidianVaultRepository.DIR_DAILY_NOTES
+                        VaultFilter.ATOMIC -> note.folderType == ObsidianVaultRepository.DIR_ATOMIC_NODES
+                        VaultFilter.TASKS -> note.pendingTasks > 0
+                        VaultFilter.ARCHIVES -> false
+                    }
+                    val matchesSearch = searchQuery.isBlank() ||
+                        note.title.contains(searchQuery, ignoreCase = true) ||
+                        note.content.contains(searchQuery, ignoreCase = true) ||
+                        note.tags.any { it.contains(searchQuery, ignoreCase = true) }
+                    matchesFilter && matchesSearch
                 }
-                val matchesSearch = searchQuery.isBlank() ||
-                    note.title.contains(searchQuery, ignoreCase = true) ||
-                    note.content.contains(searchQuery, ignoreCase = true) ||
-                    note.tags.any { it.contains(searchQuery, ignoreCase = true) }
-                matchesFilter && matchesSearch
-            }
-            .sortedByDescending { it.lastModifiedMs }
+                .sortedByDescending { it.lastModifiedMs }
+        }
+    }
+
+    val filteredTranscripts = remember(state.archivedTranscripts, searchQuery) {
+        state.archivedTranscripts.filter { item ->
+            searchQuery.isBlank() ||
+                item.fileName.contains(searchQuery, ignoreCase = true) ||
+                item.content.contains(searchQuery, ignoreCase = true)
+        }
+    }
+
+    val filteredAudio = remember(state.archivedAudioFiles, searchQuery) {
+        state.archivedAudioFiles.filter { item ->
+            searchQuery.isBlank() || item.fileName.contains(searchQuery, ignoreCase = true)
+        }
     }
 
     val handleWikiLinkClick: (String) -> Unit = { title ->
@@ -105,17 +149,25 @@ fun VaultScreen(
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val isWidePane = maxWidth >= 720.dp
         val activeNote = state.selectedNote
+        val activeTranscript = state.selectedTranscript
 
         if (isWidePane) {
             Row(modifier = Modifier.fillMaxSize()) {
-                VaultNotesListPane(
+                VaultListPane(
                     notes = sortedNotes,
+                    archivedTranscripts = filteredTranscripts,
+                    archivedAudio = filteredAudio,
+                    playbackState = state.playbackState,
+                    retentionDays = state.settings.audioRetentionDays,
                     selectedPath = activeNote?.relativePath,
+                    selectedTranscriptPath = activeTranscript?.relativePath,
                     searchQuery = searchQuery,
                     onSearchChange = { searchQuery = it },
                     filter = filter,
                     onFilterChange = { filter = it },
                     onSelectNote = { onSelectNote(it.relativePath) },
+                    onSelectTranscript = { onSelectTranscript(it.relativePath) },
+                    onTogglePlayAudio = onTogglePlayAudio,
                     modifier = Modifier
                         .weight(0.42f)
                         .fillMaxHeight()
@@ -126,44 +178,74 @@ fun VaultScreen(
                         .weight(0.58f)
                         .fillMaxHeight()
                 ) {
-                    if (activeNote != null) {
-                        MarkdownNoteReader(
-                            note = activeNote,
-                            playbackState = state.playbackState,
-                            showBackButton = false,
-                            onBack = {},
-                            onWikiLinkClick = handleWikiLinkClick,
-                            onToggleTask = { lineIdx -> onToggleTask(activeNote.relativePath, lineIdx) },
-                            onTogglePlayAudio = onTogglePlayAudio
-                        )
-                    } else {
-                        EmptyReaderPlaceholder(modifier = Modifier.align(Alignment.Center))
+                    when {
+                        activeTranscript != null -> {
+                            ArchivedTranscriptViewer(
+                                transcript = activeTranscript,
+                                showBackButton = activeNote != null,
+                                onBack = { onSelectTranscript(null) }
+                            )
+                        }
+                        activeNote != null -> {
+                            MarkdownNoteReader(
+                                note = activeNote,
+                                playbackState = state.playbackState,
+                                showBackButton = false,
+                                onBack = {},
+                                onWikiLinkClick = handleWikiLinkClick,
+                                onToggleTask = { lineIdx -> onToggleTask(activeNote.relativePath, lineIdx) },
+                                onTogglePlayAudio = onTogglePlayAudio,
+                                onOpenTranscript = onOpenTranscriptByName
+                            )
+                        }
+                        else -> {
+                            EmptyReaderPlaceholder(modifier = Modifier.align(Alignment.Center))
+                        }
                     }
                 }
             }
         } else {
-            if (activeNote != null) {
-                BackHandler { onSelectNote(null) }
-                MarkdownNoteReader(
-                    note = activeNote,
-                    playbackState = state.playbackState,
-                    showBackButton = true,
-                    onBack = { onSelectNote(null) },
-                    onWikiLinkClick = handleWikiLinkClick,
-                    onToggleTask = { lineIdx -> onToggleTask(activeNote.relativePath, lineIdx) },
-                    onTogglePlayAudio = onTogglePlayAudio
-                )
-            } else {
-                VaultNotesListPane(
-                    notes = sortedNotes,
-                    selectedPath = null,
-                    searchQuery = searchQuery,
-                    onSearchChange = { searchQuery = it },
-                    filter = filter,
-                    onFilterChange = { filter = it },
-                    onSelectNote = { onSelectNote(it.relativePath) },
-                    modifier = Modifier.fillMaxSize()
-                )
+            when {
+                activeTranscript != null -> {
+                    BackHandler { onSelectTranscript(null) }
+                    ArchivedTranscriptViewer(
+                        transcript = activeTranscript,
+                        showBackButton = true,
+                        onBack = { onSelectTranscript(null) }
+                    )
+                }
+                activeNote != null -> {
+                    BackHandler { onSelectNote(null) }
+                    MarkdownNoteReader(
+                        note = activeNote,
+                        playbackState = state.playbackState,
+                        showBackButton = true,
+                        onBack = { onSelectNote(null) },
+                        onWikiLinkClick = handleWikiLinkClick,
+                        onToggleTask = { lineIdx -> onToggleTask(activeNote.relativePath, lineIdx) },
+                        onTogglePlayAudio = onTogglePlayAudio,
+                        onOpenTranscript = onOpenTranscriptByName
+                    )
+                }
+                else -> {
+                    VaultListPane(
+                        notes = sortedNotes,
+                        archivedTranscripts = filteredTranscripts,
+                        archivedAudio = filteredAudio,
+                        playbackState = state.playbackState,
+                        retentionDays = state.settings.audioRetentionDays,
+                        selectedPath = null,
+                        selectedTranscriptPath = null,
+                        searchQuery = searchQuery,
+                        onSearchChange = { searchQuery = it },
+                        filter = filter,
+                        onFilterChange = { filter = it },
+                        onSelectNote = { onSelectNote(it.relativePath) },
+                        onSelectTranscript = { onSelectTranscript(it.relativePath) },
+                        onTogglePlayAudio = onTogglePlayAudio,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
             }
         }
     }
@@ -197,17 +279,30 @@ fun VaultScreen(
 }
 
 @Composable
-private fun VaultNotesListPane(
+private fun VaultListPane(
     notes: List<VaultNote>,
+    archivedTranscripts: List<ArchivedTranscript>,
+    archivedAudio: List<ArchivedAudioItem>,
+    playbackState: AudioPlaybackState,
+    retentionDays: Int,
     selectedPath: String?,
+    selectedTranscriptPath: String?,
     searchQuery: String,
     onSearchChange: (String) -> Unit,
     filter: VaultFilter,
     onFilterChange: (VaultFilter) -> Unit,
     onSelectNote: (VaultNote) -> Unit,
+    onSelectTranscript: (ArchivedTranscript) -> Unit,
+    onTogglePlayAudio: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val sem = LocalSynapseColors.current
+    val itemCountLabel = if (filter == VaultFilter.ARCHIVES) {
+        "Archives (${archivedTranscripts.size + archivedAudio.size})"
+    } else {
+        "Obsidian Vault (${notes.size})"
+    }
+
     Column(
         modifier = modifier.padding(top = 12.dp)
     ) {
@@ -216,7 +311,7 @@ private fun VaultNotesListPane(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "Obsidian Vault (${notes.size})",
+                text = itemCountLabel,
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.onBackground
             )
@@ -224,7 +319,7 @@ private fun VaultNotesListPane(
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = onSearchChange,
-                placeholder = { Text("Search notes, tags, or transcripts...") },
+                placeholder = { Text("Search notes, tags, or exact archives...") },
                 leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
                 trailingIcon = {
                     if (searchQuery.isNotEmpty()) {
@@ -249,7 +344,15 @@ private fun VaultNotesListPane(
                     FilterChip(
                         selected = filter == item,
                         onClick = { onFilterChange(item) },
-                        label = { Text(item.label) },
+                        label = {
+                            Text(
+                                if (item == VaultFilter.ARCHIVES && archivedTranscripts.isNotEmpty()) {
+                                    "${item.label} (${archivedTranscripts.size})"
+                                } else {
+                                    item.label
+                                }
+                            )
+                        },
                         modifier = Modifier.testTag("vault_filter_${item.name.lowercase()}")
                     )
                 }
@@ -258,7 +361,17 @@ private fun VaultNotesListPane(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        if (notes.isEmpty()) {
+        if (filter == VaultFilter.ARCHIVES) {
+            ArchivesListContent(
+                archivedTranscripts = archivedTranscripts,
+                archivedAudio = archivedAudio,
+                playbackState = playbackState,
+                retentionDays = retentionDays,
+                selectedTranscriptPath = selectedTranscriptPath,
+                onSelectTranscript = onSelectTranscript,
+                onTogglePlayAudio = onTogglePlayAudio
+            )
+        } else if (notes.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -281,7 +394,7 @@ private fun VaultNotesListPane(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = "Process a recording in Studio or sync from Google Drive to populate your vault.",
+                        text = "Process a recording or text input in Studio, or sync from Google Drive to populate your vault.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -375,6 +488,315 @@ private fun VaultNotesListPane(
 }
 
 @Composable
+private fun ArchivesListContent(
+    archivedTranscripts: List<ArchivedTranscript>,
+    archivedAudio: List<ArchivedAudioItem>,
+    playbackState: AudioPlaybackState,
+    retentionDays: Int,
+    selectedTranscriptPath: String?,
+    onSelectTranscript: (ArchivedTranscript) -> Unit,
+    onTogglePlayAudio: (String) -> Unit
+) {
+    val sem = LocalSynapseColors.current
+    if (archivedTranscripts.isEmpty() && archivedAudio.isEmpty()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Article,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(44.dp)
+                )
+                Text(
+                    text = "No Archived Files Yet",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = "Exact audio transcriptions and original text inputs are permanently stored in 98_Transcript_Archive/.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        return
+    }
+
+    LazyColumn(
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        if (archivedTranscripts.isNotEmpty()) {
+            item {
+                Text(
+                    text = "98_Transcript_Archive (${archivedTranscripts.size})",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+            items(archivedTranscripts, key = { it.relativePath }) { item ->
+                val isSelected = item.relativePath == selectedTranscriptPath
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSelectTranscript(item) }
+                        .testTag("archived_transcript_${item.fileName}"),
+                    shape = MaterialTheme.shapes.medium,
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isSelected) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+                        } else {
+                            MaterialTheme.colorScheme.surfaceContainer
+                        }
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = item.fileName,
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = formatRelativeTimestamp(item.archivedAtMs),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Text(
+                            text = item.content.trim().replace('\n', ' ').take(150),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            StatusPill(
+                                label = if (item.isFromAudio) "Voice Verbatim" else "Original Text",
+                                color = if (item.isFromAudio) sem.amber else sem.insightPurple,
+                                containerColor = if (item.isFromAudio) sem.amberContainer else sem.insightPurpleContainer
+                            )
+                            Text(
+                                text = formatBytes(item.sizeBytes),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (archivedAudio.isNotEmpty()) {
+            item {
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "99_Audio_Archive (${archivedAudio.size})",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = sem.amber
+                    )
+                    Text(
+                        text = if (retentionDays == 0) "Retained Forever" else "Retention: ${retentionDays}d",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            items(archivedAudio, key = { it.relativePath }) { audio ->
+                val isPlaying = playbackState.activeAudioName == audio.fileName && playbackState.isPlaying
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium,
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        IconButton(
+                            onClick = { onTogglePlayAudio(audio.fileName) },
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .background(sem.amberContainer)
+                                .testTag("archive_play_${audio.fileName}")
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = if (isPlaying) "Pause archived audio" else "Play archived audio",
+                                tint = sem.amber
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = audio.fileName,
+                                style = MaterialTheme.typography.titleSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "${formatBytes(audio.sizeBytes)} • ${formatRelativeTimestamp(audio.archivedAtMs)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.Outlined.AudioFile,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+
+        item { Spacer(modifier = Modifier.height(16.dp)) }
+    }
+}
+
+@Composable
+private fun ArchivedTranscriptViewer(
+    transcript: ArchivedTranscript,
+    showBackButton: Boolean,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val sem = LocalSynapseColors.current
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            tonalElevation = 2.dp
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (showBackButton) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.testTag("transcript_viewer_back_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back"
+                        )
+                    }
+                } else {
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = transcript.fileName,
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = transcript.relativePath,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                IconButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        clipboard?.setPrimaryClip(ClipData.newPlainText(transcript.fileName, transcript.content))
+                        Toast.makeText(context, "Exact transcript copied", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.testTag("copy_archived_transcript_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.ContentCopy,
+                        contentDescription = "Copy exact transcript"
+                    )
+                }
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                StatusPill(
+                    label = if (transcript.isFromAudio) "Verbatim Voice Transcript" else "Original Input Note",
+                    color = if (transcript.isFromAudio) sem.amber else sem.insightPurple,
+                    containerColor = if (transcript.isFromAudio) sem.amberContainer else sem.insightPurpleContainer
+                )
+                Text(
+                    text = "${formatBytes(transcript.sizeBytes)} • ${formatRelativeTimestamp(transcript.archivedAtMs)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+            ) {
+                SelectionContainer {
+                    Text(
+                        text = transcript.content.ifBlank { "(Empty archive file)" },
+                        style = MaterialTheme.typography.bodyMedium.copy(fontFamily = JetBrainsMonoFontFamily),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun EmptyReaderPlaceholder(modifier: Modifier = Modifier) {
     Column(
         modifier = modifier.padding(32.dp),
@@ -388,12 +810,12 @@ private fun EmptyReaderPlaceholder(modifier: Modifier = Modifier) {
             modifier = Modifier.size(48.dp)
         )
         Text(
-            text = "Select a Note",
+            text = "Select a Note or Archive",
             style = MaterialTheme.typography.titleLarge,
             color = MaterialTheme.colorScheme.onSurface
         )
         Text(
-            text = "Tap any Daily DMN entry or Atomic Node to read, toggle tasks, and traverse [[WikiLinks]].",
+            text = "Tap any Daily DMN entry, Atomic Node, or Archived Transcript to read, toggle tasks, and traverse [[WikiLinks]].",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )

@@ -1,6 +1,11 @@
 package com.example.ui.screens
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -18,11 +23,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudSync
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.CreateNewFolder
+import androidx.compose.material.icons.outlined.DeleteSweep
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Key
@@ -56,19 +66,26 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.drive.DriveFolderItem
+import com.example.data.drive.GoogleDriveAuthManager
 import com.example.data.local.SyncLogEntity
 import com.example.data.prefs.ConflictStrategy
 import com.example.data.prefs.VaultSettings
+import com.example.data.vault.ObsidianVaultRepository
 import com.example.ui.components.StatusPill
 import com.example.ui.components.formatRelativeTimestamp
 import com.example.ui.theme.LocalSynapseColors
 import com.example.ui.viewmodel.GeminiTestState
 import com.example.ui.viewmodel.MainUiState
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun SyncScreen(
@@ -83,6 +100,8 @@ fun SyncScreen(
     onDisconnectDrive: () -> Unit,
     onSyncDriveNow: () -> Unit,
     onUpdateAutomation: (autoProcess: Boolean, autoSync: Boolean, wifiOnly: Boolean, strategy: ConflictStrategy) -> Unit,
+    onUpdateAudioRetentionDays: (Int) -> Unit,
+    onPruneExpiredAudioNow: () -> Unit,
     onToggleDarkTheme: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -96,9 +115,22 @@ fun SyncScreen(
     var modelDraft by remember(state.settings.geminiModel) {
         mutableStateOf(state.settings.geminiModel)
     }
+    var retentionDaysDraft by remember(state.settings.audioRetentionDays) {
+        mutableStateOf(state.settings.audioRetentionDays.toString())
+    }
     var showApiKey by remember { mutableStateOf(false) }
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var newDriveFolderName by remember { mutableStateOf("ObsidianVault") }
+    val signingDiagnostics = remember(context) {
+        GoogleDriveAuthManager.readSigningDiagnostics(context)
+    }
+    var showOAuthGuide by remember { mutableStateOf(false) }
+
+    LaunchedEffect(state.driveAuthError) {
+        if (!state.driveAuthError.isNullOrBlank()) {
+            showOAuthGuide = true
+        }
+    }
 
     LaunchedEffect(state.settings.driveConnectedEmail) {
         if (!state.settings.driveConnectedEmail.isNullOrBlank() && state.driveFolders.isEmpty()) {
@@ -479,6 +511,76 @@ fun SyncScreen(
                             )
                         }
                     }
+
+                    if (state.settings.driveConnectedEmail == null || !state.driveAuthError.isNullOrBlank()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(MaterialTheme.shapes.small)
+                                .clickable { showOAuthGuide = !showOAuthGuide }
+                                .padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Google Cloud OAuth Setup (Package & SHA-1)",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Icon(
+                                imageVector = if (showOAuthGuide) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                                contentDescription = if (showOAuthGuide) "Hide OAuth setup" else "Show OAuth setup",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+
+                        AnimatedVisibility(visible = showOAuthGuide) {
+                            Surface(
+                                shape = MaterialTheme.shapes.small,
+                                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = "Google Drive OAuth requires an Android OAuth 2.0 Client ID matching this installed APK:",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+
+                                    CopyableCredentialRow(
+                                        label = "Package Name",
+                                        value = signingDiagnostics.packageName,
+                                        testTag = "copy_package_name_button",
+                                        onCopy = { copyToClipboard(context, "Package Name", signingDiagnostics.packageName) }
+                                    )
+
+                                    CopyableCredentialRow(
+                                        label = "Installed APK SHA-1",
+                                        value = signingDiagnostics.sha1Fingerprint ?: "Unavailable",
+                                        testTag = "copy_sha1_button",
+                                        copyEnabled = signingDiagnostics.sha1Fingerprint != null,
+                                        onCopy = {
+                                            signingDiagnostics.sha1Fingerprint?.let { sha1 ->
+                                                copyToClipboard(context, "APK SHA-1", sha1)
+                                            }
+                                        }
+                                    )
+
+                                    Text(
+                                        text = "1. Open Google Cloud Console → APIs & Services → Library and enable Google Drive API.\n" +
+                                            "2. Configure OAuth consent screen (External) and add your Gmail under Test users.\n" +
+                                            "3. Go to Credentials → Create client → Android and paste the Package Name & SHA-1 above.\n" +
+                                            "4. Wait ~2–5 min for propagation, then tap Sign in & Grant Google Drive Access.",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -498,8 +600,8 @@ fun SyncScreen(
                     Text("Automation & Sync Rules", style = MaterialTheme.typography.titleLarge)
 
                     ToggleRow(
-                        title = "Auto-Process 00_Audio_Inbox",
-                        subtitle = "Automatically send queued audio to Gemini when online",
+                        title = "Auto-Process Inbox Queues",
+                        subtitle = "Automatically send queued audio & text inputs to Gemini when online",
                         checked = state.settings.autoProcessAudio,
                         testTag = "auto_process_switch",
                         onCheckedChange = {
@@ -572,7 +674,119 @@ fun SyncScreen(
             }
         }
 
-        // 5. Activity Log
+        // 5. Archive & Audio Retention
+        item {
+            val activeRetentionDays = state.settings.audioRetentionDays
+            val cutoffMs = ObsidianVaultRepository.computeRetentionCutoffMs(activeRetentionDays)
+            val cutoffFormatted = remember(cutoffMs) {
+                cutoffMs?.let { SimpleDateFormat("MMM d, yyyy", Locale.US).format(Date(it)) }
+            }
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.large,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(Icons.Outlined.DeleteSweep, contentDescription = null, tint = sem.amber)
+                            Text("Audio Retention", style = MaterialTheme.typography.titleLarge)
+                        }
+                        StatusPill(
+                            label = if (activeRetentionDays == 0) "Forever" else "${activeRetentionDays}d",
+                            color = if (activeRetentionDays == 0) sem.emerald else sem.amber,
+                            containerColor = if (activeRetentionDays == 0) sem.emeraldContainer else sem.amberContainer
+                        )
+                    }
+
+                    Text(
+                        text = "Automatically prune processed recordings in 99_Audio_Archive/ older than your retention window. Exact transcripts in 98_Transcript_Archive/ are always preserved.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        val presets = listOf(0 to "Forever", 7 to "7d", 30 to "30d", 90 to "90d")
+                        presets.forEach { (days, label) ->
+                            FilterChip(
+                                selected = activeRetentionDays == days,
+                                onClick = {
+                                    retentionDaysDraft = days.toString()
+                                    onUpdateAudioRetentionDays(days)
+                                },
+                                label = { Text(label) },
+                                modifier = Modifier.testTag("retention_chip_$days")
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = retentionDaysDraft,
+                            onValueChange = { input ->
+                                retentionDaysDraft = input.filter { it.isDigit() }.take(4)
+                            },
+                            label = { Text("Custom retention days (0 = Forever)") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("custom_retention_days_input")
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                val parsed = retentionDaysDraft.toIntOrNull() ?: 0
+                                onUpdateAudioRetentionDays(parsed)
+                            },
+                            modifier = Modifier.testTag("apply_retention_days_button")
+                        ) {
+                            Text("Apply")
+                        }
+                    }
+
+                    val summaryText = if (cutoffFormatted != null) {
+                        "Cutoff: recordings archived before $cutoffFormatted are eligible for cleanup. (${state.archivedAudioFiles.size} audio, ${state.archivedTranscripts.size} transcript(s) stored)"
+                    } else {
+                        "Keeping all archived audio indefinitely. (${state.archivedAudioFiles.size} audio, ${state.archivedTranscripts.size} transcript(s) stored)"
+                    }
+                    Text(
+                        text = summaryText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    if (activeRetentionDays > 0) {
+                        OutlinedButton(
+                            onClick = onPruneExpiredAudioNow,
+                            enabled = state.settings.isVaultConfigured,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("prune_expired_audio_button")
+                        ) {
+                            Text("Clean Up Expired Audio Now")
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Activity Log
         if (state.logs.isNotEmpty()) {
             item {
                 Text(
@@ -691,4 +905,55 @@ private fun SyncLogRow(log: SyncLogEntity) {
             }
         }
     }
+}
+
+@Composable
+private fun CopyableCredentialRow(
+    label: String,
+    value: String,
+    testTag: String,
+    copyEnabled: Boolean = true,
+    onCopy: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(MaterialTheme.shapes.small)
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        IconButton(
+            onClick = onCopy,
+            enabled = copyEnabled,
+            modifier = Modifier.testTag(testTag)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.ContentCopy,
+                contentDescription = "Copy $label",
+                modifier = Modifier.size(18.dp)
+            )
+        }
+    }
+}
+
+private fun copyToClipboard(context: Context, label: String, text: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+    clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
+    Toast.makeText(context, "$label copied", Toast.LENGTH_SHORT).show()
 }

@@ -17,6 +17,32 @@ data class InboxAudioFile(
     val mimeType: String
 )
 
+data class InboxTextFile(
+    val uri: Uri,
+    val name: String,
+    val sizeBytes: Long,
+    val lastModifiedMs: Long,
+    val previewText: String
+)
+
+data class ArchivedTranscript(
+    val relativePath: String,
+    val fileName: String,
+    val uri: Uri,
+    val content: String,
+    val sizeBytes: Long,
+    val archivedAtMs: Long,
+    val isFromAudio: Boolean
+)
+
+data class ArchivedAudioItem(
+    val relativePath: String,
+    val fileName: String,
+    val uri: Uri,
+    val sizeBytes: Long,
+    val archivedAtMs: Long
+)
+
 data class VaultNote(
     val relativePath: String,
     val title: String,
@@ -27,7 +53,8 @@ data class VaultNote(
     val outgoingLinks: List<String>,
     val pendingTasks: Int,
     val completedTasks: Int,
-    val embeddedAudioNames: List<String>
+    val embeddedAudioNames: List<String>,
+    val embeddedTranscriptNames: List<String> = emptyList()
 )
 
 data class GraphNode(

@@ -16,7 +16,10 @@ import com.example.data.local.ProcessingJobEntity
 import com.example.data.local.SyncLogEntity
 import com.example.data.prefs.ConflictStrategy
 import com.example.data.prefs.VaultSettings
+import com.example.data.vault.ArchivedAudioItem
+import com.example.data.vault.ArchivedTranscript
 import com.example.data.vault.InboxAudioFile
+import com.example.data.vault.InboxTextFile
 import com.example.data.vault.KnowledgeGraphData
 import com.example.data.vault.VaultNote
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -39,6 +42,9 @@ sealed interface GeminiTestState {
 data class MainUiState(
     val settings: VaultSettings = VaultSettings(),
     val inboxFiles: List<InboxAudioFile> = emptyList(),
+    val inboxTextFiles: List<InboxTextFile> = emptyList(),
+    val archivedTranscripts: List<ArchivedTranscript> = emptyList(),
+    val archivedAudioFiles: List<ArchivedAudioItem> = emptyList(),
     val jobs: List<ProcessingJobEntity> = emptyList(),
     val logs: List<SyncLogEntity> = emptyList(),
     val graphData: KnowledgeGraphData = KnowledgeGraphData(),
@@ -53,10 +59,18 @@ data class MainUiState(
     val driveFolders: List<DriveFolderItem> = emptyList(),
     val isLoadingDriveFolders: Boolean = false,
     val driveAuthError: String? = null,
-    val selectedNotePath: String? = null
+    val selectedNotePath: String? = null,
+    val selectedTranscriptPath: String? = null
 ) {
     val selectedNote: VaultNote?
         get() = selectedNotePath?.let { graphData.notesByPath[it] }
+
+    val selectedTranscript: ArchivedTranscript?
+        get() = selectedTranscriptPath?.let { target ->
+            archivedTranscripts.firstOrNull {
+                it.relativePath == target || it.fileName.equals(target.substringAfterLast('/'), ignoreCase = true)
+            }
+        }
 }
 
 class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
@@ -66,6 +80,7 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
     private val _isLoadingDriveFolders = MutableStateFlow(false)
     private val _driveAuthError = MutableStateFlow<String?>(null)
     private val _selectedNotePath = MutableStateFlow<String?>(null)
+    private val _selectedTranscriptPath = MutableStateFlow<String?>(null)
 
     private val _snackbarMessages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val snackbarMessages = _snackbarMessages.asSharedFlow()
@@ -78,7 +93,8 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         val driveFolders: List<DriveFolderItem>,
         val loadingFolders: Boolean,
         val driveError: String?,
-        val selectedNotePath: String?
+        val selectedNotePath: String?,
+        val selectedTranscriptPath: String?
     )
 
     private val auxiliaryFlow = combine(
@@ -86,13 +102,25 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         _driveFolders,
         _isLoadingDriveFolders,
         _driveAuthError,
-        _selectedNotePath
-    ) { testState, folders, loadingFolders, authErr, notePath ->
-        AuxiliaryState(testState, folders, loadingFolders, authErr, notePath)
+        combine(_selectedNotePath, _selectedTranscriptPath) { notePath, transcriptPath ->
+            notePath to transcriptPath
+        }
+    ) { testState, folders, loadingFolders, authErr, selectionPair ->
+        AuxiliaryState(
+            geminiTest = testState,
+            driveFolders = folders,
+            loadingFolders = loadingFolders,
+            driveError = authErr,
+            selectedNotePath = selectionPair.first,
+            selectedTranscriptPath = selectionPair.second
+        )
     }
 
     private data class PipelineFlowState(
         val inbox: List<InboxAudioFile>,
+        val inboxText: List<InboxTextFile>,
+        val archivedTranscripts: List<ArchivedTranscript>,
+        val archivedAudio: List<ArchivedAudioItem>,
         val jobs: List<ProcessingJobEntity>,
         val logs: List<SyncLogEntity>,
         val graph: KnowledgeGraphData,
@@ -101,8 +129,18 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         val liveMsg: String?
     )
 
-    private val pipelineFlow = combine(
+    private val inboxArchiveFlow = combine(
         app.pipelineOrchestrator.inboxFiles,
+        app.pipelineOrchestrator.inboxTextFiles,
+        app.pipelineOrchestrator.archivedTranscripts,
+        app.pipelineOrchestrator.archivedAudioFiles
+    ) { audio, text, transcripts, archivedAudio ->
+        listOf(audio, text, transcripts, archivedAudio)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private val pipelineFlow = combine(
+        inboxArchiveFlow,
         app.database.processingJobDao().observeAllJobs(),
         app.database.syncLogDao().observeRecentLogs(),
         app.pipelineOrchestrator.graphData,
@@ -111,9 +149,12 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             app.pipelineOrchestrator.isSyncingDrive,
             app.pipelineOrchestrator.liveStatusMessage
         ) { p, s, m -> Triple(p, s, m) }
-    ) { inbox, jobs, logs, graph, statusTriple ->
+    ) { vaultItems, jobs, logs, graph, statusTriple ->
         PipelineFlowState(
-            inbox = inbox,
+            inbox = vaultItems[0] as List<InboxAudioFile>,
+            inboxText = vaultItems[1] as List<InboxTextFile>,
+            archivedTranscripts = vaultItems[2] as List<ArchivedTranscript>,
+            archivedAudio = vaultItems[3] as List<ArchivedAudioItem>,
             jobs = jobs,
             logs = logs,
             graph = graph,
@@ -142,6 +183,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         MainUiState(
             settings = settings,
             inboxFiles = pipe.inbox,
+            inboxTextFiles = pipe.inboxText,
+            archivedTranscripts = pipe.archivedTranscripts,
+            archivedAudioFiles = pipe.archivedAudio,
             jobs = pipe.jobs,
             logs = pipe.logs,
             graphData = pipe.graph,
@@ -156,7 +200,8 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             driveFolders = aux.driveFolders,
             isLoadingDriveFolders = aux.loadingFolders,
             driveAuthError = aux.driveError,
-            selectedNotePath = aux.selectedNotePath
+            selectedNotePath = aux.selectedNotePath,
+            selectedTranscriptPath = aux.selectedTranscriptPath
         )
     }.stateIn(
         scope = viewModelScope,
@@ -276,14 +321,67 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         }
     }
 
+    fun submitTextToQueue(
+        rawText: String,
+        title: String,
+        extension: String = "txt",
+        processImmediately: Boolean
+    ) {
+        viewModelScope.launch {
+            val settings = app.settingsRepo.currentSettings()
+            val treeUri = settings.vaultTreeUri
+            if (treeUri.isNullOrBlank()) {
+                _snackbarMessages.emit("Select your ObsidianVault folder before saving text notes.")
+                return@launch
+            }
+            val saved = app.vaultRepo.saveTextToInbox(
+                treeUriString = treeUri,
+                rawText = rawText,
+                sessionTitle = title,
+                originalExtension = extension
+            )
+            saved.onSuccess { textItem ->
+                app.pipelineOrchestrator.refreshVaultAndInbox()
+                if (processImmediately) {
+                    if (!settings.isGeminiConfigured) {
+                        _snackbarMessages.emit("Saved ${textItem.name} to 04_Text_Inbox. Add your Gemini API key in Sync to synthesize.")
+                    } else {
+                        val res = app.pipelineOrchestrator.processInboxQueue(singleTargetUri = textItem.uri.toString())
+                        res.onSuccess { count ->
+                            if (count > 0) {
+                                _snackbarMessages.emit("DMN entry synthesized & original archived to 98_Transcript_Archive.")
+                            }
+                        }.onFailure { err ->
+                            _snackbarMessages.emit(err.message ?: "Synthesis failed.")
+                        }
+                    }
+                } else {
+                    _snackbarMessages.emit("Saved ${textItem.name} to 04_Text_Inbox.")
+                }
+            }.onFailure { err ->
+                _snackbarMessages.emit(err.message ?: "Could not save text input.")
+            }
+        }
+    }
+
+    fun deleteInboxText(item: InboxTextFile) {
+        viewModelScope.launch {
+            val deleted = app.vaultRepo.deleteInboxDocument(item.uri)
+            if (deleted) {
+                app.pipelineOrchestrator.refreshVaultAndInbox()
+                _snackbarMessages.emit("Removed ${item.name} from text inbox.")
+            }
+        }
+    }
+
     fun processAllInboxNow() {
         viewModelScope.launch {
             val res = app.pipelineOrchestrator.processInboxQueue()
             res.onSuccess { count ->
                 if (count == 0) {
-                    _snackbarMessages.emit("No audio recordings waiting in 00_Audio_Inbox.")
+                    _snackbarMessages.emit("No audio or text items waiting in inbox.")
                 } else {
-                    _snackbarMessages.emit("Synthesized $count DMN session(s) into Daily Notes.")
+                    _snackbarMessages.emit("Synthesized $count DMN session(s) into Daily Notes & Archives.")
                 }
             }.onFailure { err ->
                 _snackbarMessages.emit(err.message ?: "Processing failed.")
@@ -291,11 +389,11 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         }
     }
 
-    fun processSingleAudioNow(audioUri: String) {
+    fun processSingleInboxItemNow(itemUri: String) {
         viewModelScope.launch {
-            val res = app.pipelineOrchestrator.processInboxQueue(singleTargetUri = audioUri)
+            val res = app.pipelineOrchestrator.processInboxQueue(singleTargetUri = itemUri)
             res.onSuccess { count ->
-                if (count > 0) _snackbarMessages.emit("DMN session written to 01_Daily_Notes.")
+                if (count > 0) _snackbarMessages.emit("DMN session written to 01_Daily_Notes & archived.")
             }.onFailure { err ->
                 _snackbarMessages.emit(err.message ?: "Processing failed.")
             }
@@ -310,6 +408,36 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
 
     fun openNoteByPath(relativePath: String?) {
         _selectedNotePath.value = relativePath
+        if (relativePath != null) {
+            _selectedTranscriptPath.value = null
+        }
+    }
+
+    fun openArchivedTranscript(relativePath: String?) {
+        _selectedTranscriptPath.value = relativePath
+    }
+
+    fun openArchivedTranscriptByName(fileName: String) {
+        val clean = fileName.substringAfterLast('/')
+        val match = uiState.value.archivedTranscripts.firstOrNull {
+            it.fileName.equals(clean, ignoreCase = true)
+        }
+        if (match != null) {
+            _selectedTranscriptPath.value = match.relativePath
+        } else {
+            viewModelScope.launch {
+                val treeUri = uiState.value.settings.vaultTreeUri
+                val fetched = if (!treeUri.isNullOrBlank()) {
+                    app.vaultRepo.readArchivedTranscriptByName(treeUri, clean)
+                } else null
+                if (fetched != null) {
+                    app.pipelineOrchestrator.refreshVaultAndInbox()
+                    _selectedTranscriptPath.value = fetched.relativePath
+                } else {
+                    _snackbarMessages.emit("Archived transcript not found: $clean")
+                }
+            }
+        }
     }
 
     fun openNoteByTitle(title: String): Boolean {
@@ -380,7 +508,6 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
                 }
                 is DriveAuthOutcome.Failed -> {
                     _driveAuthError.value = outcome.message
-                    _snackbarMessages.emit(outcome.message)
                 }
             }
         }
@@ -397,7 +524,6 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
                 }
                 is DriveAuthOutcome.Failed -> {
                     _driveAuthError.value = outcome.message
-                    _snackbarMessages.emit(outcome.message)
                 }
             }
         }
@@ -507,6 +633,31 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
     fun toggleDarkTheme(dark: Boolean) {
         viewModelScope.launch {
             app.settingsRepo.setDarkTheme(dark)
+        }
+    }
+
+    fun updateAudioRetentionDays(days: Int) {
+        viewModelScope.launch {
+            val clean = days.coerceAtLeast(0)
+            app.settingsRepo.setAudioRetentionDays(clean)
+            app.pipelineOrchestrator.refreshVaultAndInbox()
+            val label = if (clean == 0) "Keep Forever" else "$clean day(s)"
+            _snackbarMessages.emit("Archived audio retention set to $label.")
+        }
+    }
+
+    fun pruneExpiredAudioNow() {
+        viewModelScope.launch {
+            val res = app.pipelineOrchestrator.pruneExpiredAudioNow()
+            res.onSuccess { count ->
+                if (count == 0) {
+                    _snackbarMessages.emit("No expired audio files found in 99_Audio_Archive.")
+                } else {
+                    _snackbarMessages.emit("Removed $count expired audio recording(s) from 99_Audio_Archive.")
+                }
+            }.onFailure { err ->
+                _snackbarMessages.emit(err.message ?: "Could not prune audio archive.")
+            }
         }
     }
 

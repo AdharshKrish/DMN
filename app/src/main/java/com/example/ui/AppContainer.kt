@@ -178,9 +178,11 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                     onResumeRecording = viewModel::resumeRecording,
                                     onStopAndSaveRecording = viewModel::stopAndSaveRecording,
                                     onDiscardRecording = viewModel::discardRecording,
+                                    onSubmitTextNote = viewModel::submitTextToQueue,
                                     onProcessAllNow = viewModel::processAllInboxNow,
-                                    onProcessSingle = viewModel::processSingleAudioNow,
+                                    onProcessSingle = viewModel::processSingleInboxItemNow,
                                     onDeleteInboxAudio = viewModel::deleteInboxAudio,
+                                    onDeleteInboxText = viewModel::deleteInboxText,
                                     onRefreshInbox = viewModel::refreshAll,
                                     onOpenNote = { notePath ->
                                         viewModel.openNoteByPath(notePath)
@@ -210,6 +212,8 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                 VaultScreen(
                                     state = state,
                                     onSelectNote = viewModel::openNoteByPath,
+                                    onSelectTranscript = viewModel::openArchivedTranscript,
+                                    onOpenTranscriptByName = viewModel::openArchivedTranscriptByName,
                                     onOpenNoteByTitle = viewModel::openNoteByTitle,
                                     onCreateAtomicNote = { title ->
                                         viewModel.createAtomicNodeAndOpen(title)
@@ -233,6 +237,8 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                     onDisconnectDrive = viewModel::disconnectGoogleDrive,
                                     onSyncDriveNow = viewModel::syncDriveNow,
                                     onUpdateAutomation = viewModel::updateAutomationSettings,
+                                    onUpdateAudioRetentionDays = viewModel::updateAudioRetentionDays,
+                                    onPruneExpiredAudioNow = viewModel::pruneExpiredAudioNow,
                                     onToggleDarkTheme = viewModel::toggleDarkTheme,
                                     modifier = contentModifier
                                 )

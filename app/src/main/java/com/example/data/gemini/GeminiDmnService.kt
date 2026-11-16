@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit
 
 data class GeminiGenerationResult(
     val markdown: String,
+    val rawTranscript: String,
     val modelUsed: String,
     val extractedWikiLinks: List<String>
 )
@@ -90,7 +91,7 @@ class GeminiDmnService(private val context: Context) {
 
             onStageChanged("SYNTHESIZING")
             val prompt = buildDmnPrompt(existingNodes, timestampStr)
-            val markdown = callGenerateContent(
+            val rawResponse = callGenerateContent(
                 apiKey = cleanKey,
                 modelId = cleanModel,
                 fileUri = activeFile.uri,
@@ -98,6 +99,7 @@ class GeminiDmnService(private val context: Context) {
                 prompt = prompt
             )
 
+            val (verbatimTranscript, markdown) = parseAudioDualOutput(rawResponse)
             val links = WIKILINK_EXTRACT_REGEX.findAll(markdown)
                 .map { it.groupValues[1].trim() }
                 .filter { it.isNotBlank() }
@@ -105,7 +107,8 @@ class GeminiDmnService(private val context: Context) {
                 .toList()
 
             GeminiGenerationResult(
-                markdown = cleanFences(markdown),
+                markdown = markdown,
+                rawTranscript = verbatimTranscript,
                 modelUsed = cleanModel,
                 extractedWikiLinks = links
             )
@@ -113,6 +116,44 @@ class GeminiDmnService(private val context: Context) {
             // Privacy rule from blueprint: delete temporary audio from Google servers immediately
             deleteRemoteFileQuietly(cleanKey, uploaded.name)
         }
+    }
+
+    suspend fun processTextToDmnMarkdown(
+        apiKey: String,
+        modelId: String,
+        rawText: String,
+        existingNodes: List<String>,
+        timestampStr: String,
+        onStageChanged: suspend (stage: String) -> Unit
+    ): GeminiGenerationResult = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
+        require(rawText.isNotBlank()) { "Input text is empty." }
+        val cleanModel = modelId.trim().ifBlank { "gemini-flash-latest" }
+
+        onStageChanged("SYNTHESIZING")
+        val prompt = buildTextDmnPrompt(rawText, existingNodes, timestampStr)
+        val rawResponse = callGenerateContent(
+            apiKey = cleanKey,
+            modelId = cleanModel,
+            fileUri = null,
+            mimeType = null,
+            prompt = prompt
+        )
+
+        val cleanedMarkdown = cleanFences(rawResponse)
+        val links = WIKILINK_EXTRACT_REGEX.findAll(cleanedMarkdown)
+            .map { it.groupValues[1].trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .toList()
+
+        GeminiGenerationResult(
+            markdown = cleanedMarkdown,
+            rawTranscript = rawText,
+            modelUsed = cleanModel,
+            extractedWikiLinks = links
+        )
     }
 
     private data class UploadedGeminiFile(
@@ -218,27 +259,28 @@ class GeminiDmnService(private val context: Context) {
     private fun callGenerateContent(
         apiKey: String,
         modelId: String,
-        fileUri: String,
-        mimeType: String,
+        fileUri: String?,
+        mimeType: String?,
         prompt: String
     ): String {
+        val partsArray = JSONArray().apply {
+            if (!fileUri.isNullOrBlank() && !mimeType.isNullOrBlank()) {
+                put(
+                    JSONObject().put(
+                        "file_data",
+                        JSONObject()
+                            .put("mime_type", mimeType)
+                            .put("file_uri", fileUri)
+                    )
+                )
+            }
+            put(JSONObject().put("text", prompt))
+        }
         val payload = JSONObject().apply {
             put(
                 "contents",
                 JSONArray().put(
-                    JSONObject().put(
-                        "parts",
-                        JSONArray()
-                            .put(
-                                JSONObject().put(
-                                    "file_data",
-                                    JSONObject()
-                                        .put("mime_type", mimeType)
-                                        .put("file_uri", fileUri)
-                                )
-                            )
-                            .put(JSONObject().put("text", prompt))
-                    )
+                    JSONObject().put("parts", partsArray)
                 )
             )
             put(
@@ -317,6 +359,26 @@ class GeminiDmnService(private val context: Context) {
         }
     }
 
+    fun parseAudioDualOutput(rawResponse: String): Pair<String, String> {
+        val rawMatch = Regex("""<RAW_TRANSCRIPT>\s*([\s\S]*?)\s*</RAW_TRANSCRIPT>""", RegexOption.IGNORE_CASE)
+            .find(rawResponse)
+        val dmnMatch = Regex("""<DMN_MARKDOWN>\s*([\s\S]*?)\s*</DMN_MARKDOWN>""", RegexOption.IGNORE_CASE)
+            .find(rawResponse)
+
+        val dmnMarkdown = cleanFences(dmnMatch?.groupValues?.get(1) ?: rawResponse)
+        val rawTranscript = rawMatch?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
+            ?: run {
+                val cleanedSectionMarker = "### 🎙️ Stream of Consciousness (Cleaned)"
+                val idx = dmnMarkdown.indexOf(cleanedSectionMarker)
+                if (idx >= 0) {
+                    dmnMarkdown.substring(idx + cleanedSectionMarker.length).trim()
+                } else {
+                    dmnMarkdown
+                }
+            }
+        return rawTranscript to dmnMarkdown
+    }
+
     fun buildDmnPrompt(existingNodes: List<String>, timestampStr: String): String {
         val nodesContext = if (existingNodes.isNotEmpty()) {
             existingNodes.take(500).joinToString(", ") { "[[$it]]" }
@@ -331,8 +393,11 @@ You are an elite Default Mode Network (DMN) cognitive synthesizer and personal k
 $nodesContext
 
 ### YOUR TASK:
-Listen to the attached raw voice recording and output a structured Obsidian Markdown entry. Follow these exact rules:
+Listen to the attached raw voice recording and produce TWO clearly delimited outputs:
+1. `<RAW_TRANSCRIPT>`: An exact, word-for-word verbatim transcription of everything spoken in the recording—preserving exact wording, filler words, pauses/false starts, and punctuation as faithfully as possible without rewriting or summarizing. Do NOT add WikiLinks inside `<RAW_TRANSCRIPT>`.
+2. `<DMN_MARKDOWN>`: A structured Obsidian Markdown entry following the rules below.
 
+Rules for `<DMN_MARKDOWN>`:
 1. **PART 1: Rambler-Grade Clean Prose (`### 🎙️ Stream of Consciousness (Cleaned)`)**
    - Act like Gboard Rambler at 99.9% accuracy: transform the natural, wandering spoken recording into clean, articulate, first-person ("I") written prose.
    - Strip all filler words ("um", "uh", "like", "you know"), false starts, stutters, and accidental repetitions.
@@ -349,7 +414,12 @@ Listen to the attached raw voice recording and output a structured Obsidian Mark
 3. **PART 3: Inline Metadata Tags**
    - Provide a single line of relevant Obsidian tags at the top of the entry (e.g., `#dmn #journal #insight #architecture`).
 
-### OUTPUT FORMAT (Valid Markdown Only, No Code Fences Wrapping the Response):
+### OUTPUT FORMAT (Return BOTH XML-style blocks cleanly without outer code fences):
+<RAW_TRANSCRIPT>
+[Exact word-for-word verbatim transcription of the audio...]
+</RAW_TRANSCRIPT>
+
+<DMN_MARKDOWN>
 ## 🕒 DMN Session — $timestampStr
 **Tags:** #dmn [add 2-4 contextual #tags]
 **Linked Hubs:** [comma-separated list of top [[WikiLinks]] used]
@@ -369,6 +439,65 @@ Listen to the attached raw voice recording and output a structured Obsidian Mark
 
 ### 🎙️ Stream of Consciousness (Cleaned)
 [Full Rambler-cleaned first-person prose with natural inline [[WikiLinks]]...]
+</DMN_MARKDOWN>
+        """.trimIndent()
+    }
+
+    fun buildTextDmnPrompt(rawText: String, existingNodes: List<String>, timestampStr: String): String {
+        val nodesContext = if (existingNodes.isNotEmpty()) {
+            existingNodes.take(500).joinToString(", ") { "[[$it]]" }
+        } else {
+            "None yet (propose new atomic [[Concept]] links freely)"
+        }
+
+        return """
+You are an elite Default Mode Network (DMN) cognitive synthesizer and personal knowledge graph architect for an Obsidian vault.
+
+### EXISTING KNOWLEDGE GRAPH NODES IN VAULT:
+$nodesContext
+
+### INPUT NOTE / EXTERNAL TRANSCRIPT:
+\"\"\"
+$rawText
+\"\"\"
+
+### YOUR TASK:
+Analyze the user's pasted transcript or written note above and output a structured Obsidian Markdown entry. Follow these exact rules:
+
+1. **PART 1: Structured Thought Prose (`### 📝 Captured Thought (Graph-Linked)`)**
+   - Preserve the user's full meaning, voice, nuance, and detail without over-summarizing. If the input is a rough transcript, polish clarity gently while retaining all ideas.
+   - **Bi-Directional Graph Linking:** Whenever the text mentions a concept, person, project, recurring problem, or mental model that matches an item in the `EXISTING KNOWLEDGE GRAPH NODES` list (or warrants a new evergreen atomic topic node), naturally wrap it in Obsidian WikiLinks like `[[Concept Name]]` directly inline!
+
+2. **PART 2: DMN Cognitive Synthesis (`### 🧠 DMN Synthesis & Graph Connections`)**
+   Extract and structure the deeper mental connections into four bulleted subsections:
+   - **💡 Core Realizations & Insights:** Breakthrough ideas or underlying truths uncovered (with inline `[[WikiLinks]]`).
+   - **🔄 Past Solutions & Recognized Patterns:** Connections to past habits, previous problems, or historical solutions.
+   - **🎯 Future Goals & Next Actions:** Concrete actionable next steps formatted as Obsidian tasks (`- [ ] Task description`).
+   - **🕸️ Suggested Graph Connections:** Explicitly list 3 to 6 `[[Node Name]]` hubs (existing or new) that this thought clusters around, and briefly state *why* they connect.
+
+3. **PART 3: Inline Metadata Tags**
+   - Provide a single line of relevant Obsidian tags at the top of the entry (e.g., `#dmn #note #insight`).
+
+### OUTPUT FORMAT (Valid Markdown Only, No Code Fences Wrapping the Response):
+## 🕒 DMN Note Session — $timestampStr
+**Tags:** #dmn #text-input [add 2-4 contextual #tags]
+**Linked Hubs:** [comma-separated list of top [[WikiLinks]] used]
+
+### 🧠 DMN Synthesis & Graph Connections
+**💡 Core Realizations & Insights**
+- ...
+
+**🔄 Past Solutions & Recognized Patterns**
+- ...
+
+**🎯 Future Goals & Next Actions**
+- [ ] ...
+
+**🕸️ Suggested Graph Connections**
+- [[Node A]] ↔ [[Node B]]: Explanation of connection...
+
+### 📝 Captured Thought (Graph-Linked)
+[Graph-linked prose preserving the full depth of the user's input with natural inline [[WikiLinks]]...]
         """.trimIndent()
     }
 }
