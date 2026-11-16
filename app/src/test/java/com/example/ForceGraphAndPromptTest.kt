@@ -108,6 +108,33 @@ class ForceGraphAndPromptTest {
     }
 
     @Test
+    fun `gemini error details include http code status model and details`() {
+        val service = GeminiDmnService(ApplicationProvider.getApplicationContext())
+        val json503 = """
+            {
+              "error": {
+                "code": 503,
+                "message": "This model is currently experiencing high demand.",
+                "status": "UNAVAILABLE",
+                "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "MODEL_OVERLOADED"}]
+              }
+            }
+        """.trimIndent()
+        val formatted = service.parseGeminiErrorDetails(503, "gemini-flash-latest", json503)
+        assertTrue(formatted.contains("HTTP 503"))
+        assertTrue(formatted.contains("UNAVAILABLE"))
+        assertTrue(formatted.contains("gemini-flash-latest"))
+        assertTrue(formatted.contains("MODEL_OVERLOADED"))
+
+        val plainFallback = service.parseGeminiErrorDetails(502, "gemini-2.5-flash", "Bad Gateway HTML")
+        assertTrue(plainFallback.contains("HTTP 502"))
+        assertTrue(plainFallback.contains("gemini-2.5-flash"))
+        assertTrue(plainFallback.contains("Bad Gateway HTML"))
+        assertTrue(service.readTimeoutSeconds() >= 300L)
+        assertTrue(GeminiDmnService.MAX_RETRY_WINDOW_MS >= 300_000L)
+    }
+
+    @Test
     fun `drive auth manager maps unregistered console status 8 and reads package name`() {
         val ctx = ApplicationProvider.getApplicationContext<android.content.Context>()
         val manager = GoogleDriveAuthManager(ctx)

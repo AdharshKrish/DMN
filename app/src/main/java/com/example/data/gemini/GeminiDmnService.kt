@@ -27,14 +27,22 @@ data class GeminiGenerationResult(
 class GeminiDmnService(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(180, TimeUnit.SECONDS)
-        .writeTimeout(180, TimeUnit.SECONDS)
+        .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(READ_WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .writeTimeout(READ_WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .callTimeout(0, TimeUnit.SECONDS)
         .build()
+
+    fun readTimeoutSeconds(): Long = client.readTimeoutMillis / 1000L
 
     companion object {
         private const val BASE_URL = "https://generativelanguage.googleapis.com"
         private val WIKILINK_EXTRACT_REGEX = Regex("""(?<!!)\[\[([^\[\]|#]+)(?:#[^\[\]|]+)?(?:\|[^\[\]]+)?]]""")
+        private val TRANSIENT_HTTP_CODES = setOf(429, 500, 502, 503, 504)
+        const val CONNECT_TIMEOUT_SECONDS = 60L
+        const val READ_WRITE_TIMEOUT_SECONDS = 360L // 6 minutes (> 5 min) per request
+        const val MAX_RETRY_WINDOW_MS = 300_000L // 5-minute retry window for transient demand/rate spikes
+        private const val MAX_BACKOFF_MS = 30_000L
     }
 
     suspend fun testApiKey(apiKey: String, modelId: String): Result<String> = withContext(Dispatchers.IO) {
@@ -51,8 +59,8 @@ class GeminiDmnService(private val context: Context) {
             client.newCall(request).execute().use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
-                    val errMsg = parseGeminiError(bodyStr) ?: "HTTP ${response.code}"
-                    throw IOException("API check failed: $errMsg")
+                    val errDetail = parseGeminiErrorDetails(response.code, cleanModel, bodyStr)
+                    throw IOException("API check failed — $errDetail")
                 }
                 val json = JSONObject(bodyStr)
                 val displayName = json.optString("displayName", cleanModel)
@@ -70,7 +78,8 @@ class GeminiDmnService(private val context: Context) {
         sizeBytes: Long,
         existingNodes: List<String>,
         timestampStr: String,
-        onStageChanged: suspend (stage: String) -> Unit
+        onStageChanged: suspend (stage: String) -> Unit,
+        onStatusDetail: (suspend (String) -> Unit)? = null
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
@@ -96,7 +105,8 @@ class GeminiDmnService(private val context: Context) {
                 modelId = cleanModel,
                 fileUri = activeFile.uri,
                 mimeType = activeFile.mimeType.ifBlank { mimeType },
-                prompt = prompt
+                prompt = prompt,
+                onStatusDetail = onStatusDetail
             )
 
             val (verbatimTranscript, markdown) = parseAudioDualOutput(rawResponse)
@@ -124,7 +134,8 @@ class GeminiDmnService(private val context: Context) {
         rawText: String,
         existingNodes: List<String>,
         timestampStr: String,
-        onStageChanged: suspend (stage: String) -> Unit
+        onStageChanged: suspend (stage: String) -> Unit,
+        onStatusDetail: (suspend (String) -> Unit)? = null
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
@@ -138,7 +149,8 @@ class GeminiDmnService(private val context: Context) {
             modelId = cleanModel,
             fileUri = null,
             mimeType = null,
-            prompt = prompt
+            prompt = prompt,
+            onStatusDetail = onStatusDetail
         )
 
         val cleanedMarkdown = cleanFences(rawResponse)
@@ -229,7 +241,7 @@ class GeminiDmnService(private val context: Context) {
     }
 
     private suspend fun waitForFileActive(apiKey: String, fileName: String): UploadedGeminiFile {
-        repeat(60) {
+        repeat(150) { // Up to 5 minutes (150 * 2s) for audio file indexing
             val request = Request.Builder()
                 .url("$BASE_URL/v1beta/$fileName")
                 .header("x-goog-api-key", apiKey)
@@ -256,12 +268,13 @@ class GeminiDmnService(private val context: Context) {
         throw IOException("Timed out waiting for Gemini audio file indexing.")
     }
 
-    private fun callGenerateContent(
+    private suspend fun callGenerateContent(
         apiKey: String,
         modelId: String,
         fileUri: String?,
         mimeType: String?,
-        prompt: String
+        prompt: String,
+        onStatusDetail: (suspend (String) -> Unit)? = null
     ): String {
         val partsArray = JSONArray().apply {
             if (!fileUri.isNullOrBlank() && !mimeType.isNullOrBlank()) {
@@ -289,32 +302,112 @@ class GeminiDmnService(private val context: Context) {
             )
         }
 
-        val request = Request.Builder()
-            .url("$BASE_URL/v1beta/models/$modelId:generateContent")
-            .header("x-goog-api-key", apiKey)
-            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .build()
+        val payloadJson = payload.toString()
+        val startMs = System.currentTimeMillis()
+        var attempt = 0
+        var lastError: IOException? = null
 
-        return client.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                val err = parseGeminiError(bodyStr) ?: "HTTP ${response.code}"
-                throw IOException("Gemini generation error: $err")
-            }
-            val json = JSONObject(bodyStr)
-            val candidates = json.optJSONArray("candidates")
-                ?: throw IOException("Gemini returned no candidates.")
-            if (candidates.length() == 0) {
-                throw IOException("Gemini returned an empty response.")
-            }
-            val parts = candidates.getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts")
-            buildString {
-                for (i in 0 until parts.length()) {
-                    append(parts.getJSONObject(i).optString("text", ""))
+        while (true) {
+            attempt++
+            val request = Request.Builder()
+                .url("$BASE_URL/v1beta/models/$modelId:generateContent")
+                .header("x-goog-api-key", apiKey)
+                .post(payloadJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+
+            var retryWaitMs: Long? = null
+            var retryStatusMsg: String? = null
+
+            val generatedText = try {
+                client.newCall(request).execute().use { response ->
+                    val bodyStr = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        val details = parseGeminiErrorDetails(response.code, modelId, bodyStr)
+                        val elapsedMs = System.currentTimeMillis() - startMs
+                        val isTransient = response.code in TRANSIENT_HTTP_CODES
+                        if (isTransient && elapsedMs < MAX_RETRY_WINDOW_MS) {
+                            val rawBackoff = 5000L * (1L shl (attempt - 1).coerceAtMost(4))
+                            val waitMs = rawBackoff.coerceAtMost(MAX_BACKOFF_MS)
+                                .coerceAtMost((MAX_RETRY_WINDOW_MS - elapsedMs).coerceAtLeast(1000L))
+                            val elapsedSec = elapsedMs / 1000L
+                            val waitSec = (waitMs / 1000L).coerceAtLeast(1L)
+                            retryWaitMs = waitMs
+                            retryStatusMsg = "Gemini $modelId busy (HTTP ${response.code}), waiting ${waitSec}s before retry #${attempt + 1} (${elapsedSec}s / ${MAX_RETRY_WINDOW_MS / 1000L}s window)..."
+                            lastError = IOException(details)
+                            return@use null
+                        }
+                        val elapsedSec = elapsedMs / 1000L
+                        val attemptsNote = if (attempt > 1) " (failed after $attempt attempts over ${elapsedSec}s)" else ""
+                        val hint = if (response.code == 503 || response.code == 429) {
+                            "\nTip: Switch Gemini Model ID in Sync (e.g. gemini-2.5-flash) or retry shortly."
+                        } else {
+                            ""
+                        }
+                        throw IOException("Gemini generation error$attemptsNote — $details$hint")
+                    }
+
+                    val json = JSONObject(bodyStr)
+                    val promptFeedback = json.optJSONObject("promptFeedback")
+                    val blockReason = promptFeedback?.optString("blockReason")?.takeIf { it.isNotBlank() }
+                    val candidates = json.optJSONArray("candidates")
+                    if (candidates == null || candidates.length() == 0) {
+                        val feedbackStr = promptFeedback?.toString() ?: bodyStr.take(300)
+                        throw IOException(
+                            "Gemini returned no candidates [model=$modelId" +
+                                (if (blockReason != null) ", blockReason=$blockReason" else "") +
+                                "]. Response: $feedbackStr"
+                        )
+                    }
+
+                    val firstCandidate = candidates.getJSONObject(0)
+                    val finishReason = firstCandidate.optString("finishReason", "")
+                    val contentObj = firstCandidate.optJSONObject("content")
+                    val parts = contentObj?.optJSONArray("parts")
+                    if (parts == null || parts.length() == 0) {
+                        throw IOException(
+                            "Gemini returned empty content [model=$modelId, finishReason=$finishReason]. Response: ${bodyStr.take(300)}"
+                        )
+                    }
+
+                    val text = buildString {
+                        for (i in 0 until parts.length()) {
+                            append(parts.getJSONObject(i).optString("text", ""))
+                        }
+                    }.trim()
+
+                    if (text.isEmpty()) {
+                        throw IOException(
+                            "Gemini returned blank text [model=$modelId, finishReason=$finishReason]."
+                        )
+                    }
+                    text
                 }
-            }.trim()
+            } catch (ioe: IOException) {
+                val msg = ioe.message.orEmpty()
+                // Do not double-wrap errors we intentionally threw above
+                if (msg.startsWith("Gemini generation error") ||
+                    msg.startsWith("Gemini returned ")
+                ) {
+                    throw ioe
+                }
+                val elapsedMs = System.currentTimeMillis() - startMs
+                if (elapsedMs < MAX_RETRY_WINDOW_MS) {
+                    val waitMs = 5000L.coerceAtMost((MAX_RETRY_WINDOW_MS - elapsedMs).coerceAtLeast(1000L))
+                    retryWaitMs = waitMs
+                    retryStatusMsg = "Network timeout/blip (${ioe.javaClass.simpleName}), retrying in ${waitMs / 1000L}s..."
+                    lastError = ioe
+                    null
+                } else {
+                    throw IOException(
+                        "Gemini connection error after $attempt attempt(s) over ${elapsedMs / 1000L}s [model=$modelId]: ${ioe.javaClass.simpleName}: ${ioe.message}",
+                        ioe
+                    )
+                }
+            }
+
+            if (generatedText != null) return generatedText
+            retryStatusMsg?.let { onStatusDetail?.invoke(it) }
+            retryWaitMs?.let { delay(it) }
         }
     }
 
@@ -348,6 +441,34 @@ class GeminiDmnService(private val context: Context) {
         return runCatching {
             JSONObject(body).optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
         }.getOrNull()
+    }
+
+    fun parseGeminiErrorDetails(httpCode: Int, modelId: String?, body: String?): String {
+        val modelTag = if (!modelId.isNullOrBlank()) " [model=$modelId]" else ""
+        if (body.isNullOrBlank()) {
+            return "HTTP $httpCode$modelTag: Empty error response body from Gemini API."
+        }
+        return runCatching {
+            val root = JSONObject(body)
+            val errObj = root.optJSONObject("error")
+            if (errObj == null) {
+                "HTTP $httpCode$modelTag: ${body.trim().take(400)}"
+            } else {
+                val apiCode = errObj.optInt("code", httpCode)
+                val status = errObj.optString("status", "").trim()
+                val msg = errObj.optString("message", "").trim().ifBlank { "Unknown Gemini API error" }
+                val statusPart = if (status.isNotEmpty()) " ($status)" else ""
+                val detailsArr = errObj.optJSONArray("details")
+                val detailsText = if (detailsArr != null && detailsArr.length() > 0) {
+                    " | Details: ${detailsArr.toString().take(300)}"
+                } else {
+                    ""
+                }
+                "HTTP $apiCode$statusPart$modelTag: $msg$detailsText"
+            }
+        }.getOrElse {
+            "HTTP $httpCode$modelTag: ${body.trim().take(400)}"
+        }
     }
 
     private fun cleanFences(raw: String): String {

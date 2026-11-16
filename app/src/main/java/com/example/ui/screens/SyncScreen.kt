@@ -9,6 +9,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AccountCircle
@@ -281,6 +283,28 @@ fun SyncScreen(
                             .fillMaxWidth()
                             .testTag("gemini_model_input")
                     )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val modelPresets = listOf(
+                            "gemini-flash-latest",
+                            "gemini-2.5-flash",
+                            "gemini-2.5-flash-lite",
+                            "gemini-2.5-pro"
+                        )
+                        modelPresets.forEach { preset ->
+                            FilterChip(
+                                selected = modelDraft.trim() == preset,
+                                onClick = { modelDraft = preset },
+                                label = { Text(preset) },
+                                modifier = Modifier.testTag("model_preset_$preset")
+                            )
+                        }
+                    }
 
                     when (val test = state.geminiTestState) {
                         is GeminiTestState.Testing -> LinearProgressIndicator(modifier = Modifier.fillMaxWidth())

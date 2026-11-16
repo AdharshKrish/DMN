@@ -266,6 +266,9 @@ class DmnPipelineOrchestrator(
                                 .getOrDefault(JobStatus.SYNTHESIZING)
                             _liveStatusMessage.value = "${status.displayLabel}: ${audio.name}"
                             updateJob(audio.uri.toString(), audio.name, audio.sizeBytes, status, null, null, null, null, nowMs)
+                        },
+                        onStatusDetail = { detail ->
+                            _liveStatusMessage.value = "${audio.name}: $detail"
                         }
                     )
 
@@ -311,7 +314,8 @@ class DmnPipelineOrchestrator(
                     )
                     processedCount++
                 } catch (e: Exception) {
-                    val msg = e.message ?: "Failed processing ${audio.name}"
+                    val msg = e.message?.takeIf { it.isNotBlank() }
+                        ?: "${e.javaClass.simpleName}: Failed processing ${audio.name}"
                     updateJob(audio.uri.toString(), audio.name, audio.sizeBytes, JobStatus.FAILED, msg, null, null, null, nowMs)
                     logDao.insertLog(
                         SyncLogEntity(
@@ -347,6 +351,9 @@ class DmnPipelineOrchestrator(
                                 .getOrDefault(JobStatus.SYNTHESIZING)
                             _liveStatusMessage.value = "${status.displayLabel}: ${textFile.name}"
                             updateJob(textFile.uri.toString(), textFile.name, textFile.sizeBytes, status, null, null, null, null, nowMs)
+                        },
+                        onStatusDetail = { detail ->
+                            _liveStatusMessage.value = "${textFile.name}: $detail"
                         }
                     )
 
@@ -392,7 +399,8 @@ class DmnPipelineOrchestrator(
                     )
                     processedCount++
                 } catch (e: Exception) {
-                    val msg = e.message ?: "Failed processing ${textFile.name}"
+                    val msg = e.message?.takeIf { it.isNotBlank() }
+                        ?: "${e.javaClass.simpleName}: Failed processing ${textFile.name}"
                     updateJob(textFile.uri.toString(), textFile.name, textFile.sizeBytes, JobStatus.FAILED, msg, null, null, null, nowMs)
                     logDao.insertLog(
                         SyncLogEntity(
