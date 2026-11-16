@@ -1,0 +1,114 @@
+name: Android Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag name (e.g. v1.0.0). Defaults to run number if empty.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release Artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare debug keystore
+        run: |
+          if [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          else
+            keytool -genkeypair -v -keystore debug.keystore -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Run unit & Robolectric tests
+        run: gradle :app:testDebugUnitTest --no-daemon
+
+      - name: Build Debug APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Check Release Keystore secrets
+        id: check_signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "has_release_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_release_signing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decode Release Keystore & Build Signed Release APK/AAB
+        if: steps.check_signing.outputs.has_release_signing == 'true'
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+        run: |
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          gradle :app:assembleRelease :app:bundleRelease --no-daemon
+
+      - name: Collect release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp app/build/outputs/apk/debug/*.apk release-artifacts/ || true
+          if [ -d app/build/outputs/apk/release ]; then
+            cp app/build/outputs/apk/release/*.apk release-artifacts/ || true
+          fi
+          if [ -d app/build/outputs/bundle/release ]; then
+            cp app/build/outputs/bundle/release/*.aab release-artifacts/ || true
+          fi
+          rm -f "${{ github.workspace }}/my-upload-key.jks"
+          ls -lh release-artifacts/
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: synapse-dmn-release-artifacts
+          path: release-artifacts/*
+          if-no-files-found: error
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "name=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=v1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Synapse DMN ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: release-artifacts/*
