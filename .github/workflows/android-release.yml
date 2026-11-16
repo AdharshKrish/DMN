@@ -91,15 +91,49 @@ jobs:
           echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
           gradle :app:assembleRelease :app:bundleRelease --no-daemon --max-workers=2 --stacktrace
 
-      - name: Collect release artifacts
+      - name: Determine App Name & Release Tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            RAW_TAG="${{ github.event.inputs.release_tag }}"
+          else
+            RAW_TAG="v1.0.${{ github.run_number }}"
+          fi
+          SAFE_TAG=$(printf '%s' "$RAW_TAG" | tr '/ ' '--' | tr -cd 'A-Za-z0-9._-')
+          APP_NAME=$(sed -n 's/.*<string name="app_name">\([^<]*\)<\/string>.*/\1/p' app/src/main/res/values/strings.xml | head -n1)
+          APP_SLUG=$(printf '%s' "${APP_NAME:-Synapse DMN}" | sed -E 's/[[:space:]]+/-/g' | tr -cd 'A-Za-z0-9._-')
+          echo "name=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "safe_tag=$SAFE_TAG" >> "$GITHUB_OUTPUT"
+          echo "app_slug=$APP_SLUG" >> "$GITHUB_OUTPUT"
+          echo "app_name=${APP_NAME:-Synapse DMN}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect & rename release artifacts
+        env:
+          APP_SLUG: ${{ steps.tag.outputs.app_slug }}
+          SAFE_TAG: ${{ steps.tag.outputs.safe_tag }}
         run: |
           mkdir -p release-artifacts
-          cp app/build/outputs/apk/debug/*.apk release-artifacts/ || true
+          shopt -s nullglob
+          for apk in app/build/outputs/apk/debug/*.apk; do
+            base=$(basename "$apk")
+            suffix="${base#app-}"
+            cp "$apk" "release-artifacts/${APP_SLUG}-${SAFE_TAG}-${suffix}"
+          done
           if [ -d app/build/outputs/apk/release ]; then
-            cp app/build/outputs/apk/release/*.apk release-artifacts/ || true
+            for apk in app/build/outputs/apk/release/*.apk; do
+              base=$(basename "$apk")
+              suffix="${base#app-}"
+              cp "$apk" "release-artifacts/${APP_SLUG}-${SAFE_TAG}-${suffix}"
+            done
           fi
           if [ -d app/build/outputs/bundle/release ]; then
-            cp app/build/outputs/bundle/release/*.aab release-artifacts/ || true
+            for aab in app/build/outputs/bundle/release/*.aab; do
+              base=$(basename "$aab")
+              suffix="${base#app-}"
+              cp "$aab" "release-artifacts/${APP_SLUG}-${SAFE_TAG}-${suffix}"
+            done
           fi
           rm -f "${{ github.workspace }}/my-upload-key.jks"
           ls -lh release-artifacts/
@@ -107,25 +141,14 @@ jobs:
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: synapse-dmn-release-artifacts
+          name: ${{ steps.tag.outputs.app_slug }}-${{ steps.tag.outputs.safe_tag }}-artifacts
           path: release-artifacts/*
           if-no-files-found: error
-
-      - name: Determine Release Tag
-        id: tag
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          elif [ -n "${{ github.event.inputs.release_tag }}" ]; then
-            echo "name=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=v1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          name: Synapse DMN ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.app_name }} ${{ steps.tag.outputs.name }}
           generate_release_notes: true
           files: release-artifacts/*
