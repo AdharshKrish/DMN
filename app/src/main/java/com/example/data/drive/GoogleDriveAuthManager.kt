@@ -1,0 +1,131 @@
+package com.example.data.drive
+
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import androidx.activity.result.IntentSenderRequest
+import androidx.credentials.ClearCredentialStateRequest
+import androidx.credentials.CredentialManager
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.AuthorizationResult
+import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.Scope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+sealed interface DriveAuthOutcome {
+    data class Authorized(val accessToken: String, val email: String?) : DriveAuthOutcome
+    data class NeedsUserConsent(val intentSenderRequest: IntentSenderRequest) : DriveAuthOutcome
+    data class Failed(val message: String) : DriveAuthOutcome
+}
+
+class GoogleDriveAuthManager(private val context: Context) {
+
+    private val httpClient = OkHttpClient()
+
+    companion object {
+        private val DRIVE_SCOPES = listOf(
+            Scope("https://www.googleapis.com/auth/drive"),
+            Scope("https://www.googleapis.com/auth/userinfo.email")
+        )
+    }
+
+    suspend fun authorizeDrive(activity: Activity? = null): DriveAuthOutcome {
+        return try {
+            val authClient = if (activity != null) {
+                Identity.getAuthorizationClient(activity)
+            } else {
+                Identity.getAuthorizationClient(context)
+            }
+            val request = AuthorizationRequest.builder()
+                .setRequestedScopes(DRIVE_SCOPES)
+                .build()
+
+            val result: AuthorizationResult = suspendCancellableCoroutine { cont ->
+                authClient.authorize(request)
+                    .addOnSuccessListener { res -> cont.resume(res) }
+                    .addOnFailureListener { err -> cont.resumeWithException(err) }
+            }
+
+            if (result.hasResolution()) {
+                val pendingIntent = result.pendingIntent
+                    ?: return DriveAuthOutcome.Failed("Google authorization requires user consent, but no consent intent was provided.")
+                DriveAuthOutcome.NeedsUserConsent(
+                    IntentSenderRequest.Builder(pendingIntent.intentSender).build()
+                )
+            } else {
+                val token = result.accessToken
+                    ?: return DriveAuthOutcome.Failed("Google authorization succeeded without an access token.")
+                val email = fetchUserEmail(token)
+                DriveAuthOutcome.Authorized(accessToken = token, email = email)
+            }
+        } catch (e: ApiException) {
+            DriveAuthOutcome.Failed(mapGoogleAuthError(e))
+        } catch (e: Exception) {
+            DriveAuthOutcome.Failed(e.message ?: "Google Drive authorization failed.")
+        }
+    }
+
+    suspend fun handleConsentResult(data: Intent?): DriveAuthOutcome {
+        return try {
+            val result = Identity.getAuthorizationClient(context).getAuthorizationResultFromIntent(data)
+            val token = result.accessToken
+                ?: return DriveAuthOutcome.Failed("Drive authorization was cancelled or returned no token.")
+            val email = fetchUserEmail(token)
+            DriveAuthOutcome.Authorized(accessToken = token, email = email)
+        } catch (e: ApiException) {
+            DriveAuthOutcome.Failed(mapGoogleAuthError(e))
+        } catch (e: Exception) {
+            DriveAuthOutcome.Failed(e.message ?: "Failed to complete Google Drive sign-in.")
+        }
+    }
+
+    suspend fun fetchFreshAccessTokenSilently(): Result<String> = runCatching {
+        val outcome = authorizeDrive(null)
+        when (outcome) {
+            is DriveAuthOutcome.Authorized -> outcome.accessToken
+            is DriveAuthOutcome.NeedsUserConsent ->
+                throw IllegalStateException("Google Drive session expired. Please reconnect in the Sync tab.")
+            is DriveAuthOutcome.Failed ->
+                throw IllegalStateException(outcome.message)
+        }
+    }
+
+    suspend fun signOut() {
+        runCatching {
+            CredentialManager.create(context).clearCredentialState(ClearCredentialStateRequest())
+        }
+    }
+
+    private suspend fun fetchUserEmail(accessToken: String): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder()
+                .url("https://www.googleapis.com/oauth2/v3/userinfo")
+                .header("Authorization", "Bearer $accessToken")
+                .get()
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching null
+                val json = JSONObject(resp.body?.string().orEmpty())
+                json.optString("email").takeIf { it.isNotBlank() }
+            }
+        }.getOrNull()
+    }
+
+    private fun mapGoogleAuthError(e: ApiException): String {
+        val code = e.statusCode
+        return when (code) {
+            10 -> "OAuth client not yet configured for this app's package & SHA-1 in Google Cloud Console (Code 10: DEVELOPER_ERROR)."
+            12501 -> "Google Drive sign-in was cancelled."
+            7 -> "Network unavailable while contacting Google Identity."
+            else -> "Google sign-in error (code $code): ${e.localizedMessage ?: "Unknown error"}"
+        }
+    }
+}

@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">Synapse DMN</string>
+    <string name="nav_studio">Studio</string>
+    <string name="nav_graph">Graph</string>
+    <string name="nav_vault">Vault</string>
+    <string name="nav_sync">Sync</string>
+    <string name="studio_title">DMN Voice Studio</string>
+    <string name="graph_title">Knowledge Graph</string>
+    <string name="vault_title">Obsidian Vault</string>
+    <string name="sync_title">Drive Sync &amp; Setup</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "Synapse DMN",
+  "description": "Automated Obsidian voice journaling, Gemini-powered knowledge graph linking, and two-way Google Drive sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
