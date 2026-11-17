@@ -95,6 +95,7 @@ fun SyncScreen(
     onPickVaultFolder: () -> Unit,
     onSaveGeminiConfig: (apiKey: String, model: String) -> Unit,
     onTestGeminiConnection: (apiKey: String, model: String) -> Unit,
+    onFetchAvailableModels: (apiKey: String) -> Unit,
     onAuthorizeDrive: (Activity) -> Unit,
     onRefreshDriveFolders: () -> Unit,
     onSelectDriveFolder: (DriveFolderItem) -> Unit,
@@ -284,18 +285,50 @@ fun SyncScreen(
                             .testTag("gemini_model_input")
                     )
 
+                    if (modelDraft.trim().startsWith("gemini-2.5", ignoreCase = true)) {
+                        Text(
+                            text = "Note: gemini-2.5-* models are retired for new keys. Use gemini-3.8-flash or gemini-3.5-flash-lite.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = sem.amber
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (state.availableGeminiModels.isNotEmpty()) {
+                                "Key Models (${state.availableGeminiModels.size})"
+                            } else {
+                                "Recommended Models"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        TextButton(
+                            onClick = { onFetchAvailableModels(apiKeyDraft) },
+                            enabled = apiKeyDraft.isNotBlank() && !state.isLoadingGeminiModels,
+                            modifier = Modifier.testTag("fetch_gemini_models_button")
+                        ) {
+                            Text(if (state.isLoadingGeminiModels) "Loading..." else "Load My Key's Models")
+                        }
+                    }
+
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        val modelPresets = listOf(
-                            "gemini-flash-latest",
-                            "gemini-2.5-flash",
-                            "gemini-2.5-flash-lite",
-                            "gemini-2.5-pro"
+                        val fallbackPresets = listOf(
+                            "gemini-3.8-flash",
+                            "gemini-3.5-flash-lite",
+                            "gemini-flash-lite-latest",
+                            "gemini-flash-latest"
                         )
+                        val modelPresets = (state.availableGeminiModels + fallbackPresets).distinct()
                         modelPresets.forEach { preset ->
                             FilterChip(
                                 selected = modelDraft.trim() == preset,

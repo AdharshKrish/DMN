@@ -60,7 +60,9 @@ data class MainUiState(
     val isLoadingDriveFolders: Boolean = false,
     val driveAuthError: String? = null,
     val selectedNotePath: String? = null,
-    val selectedTranscriptPath: String? = null
+    val selectedTranscriptPath: String? = null,
+    val availableGeminiModels: List<String> = emptyList(),
+    val isLoadingGeminiModels: Boolean = false
 ) {
     val selectedNote: VaultNote?
         get() = selectedNotePath?.let { graphData.notesByPath[it] }
@@ -82,6 +84,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
     private val _selectedNotePath = MutableStateFlow<String?>(null)
     private val _selectedTranscriptPath = MutableStateFlow<String?>(null)
 
+    private val _availableGeminiModels = MutableStateFlow<List<String>>(emptyList())
+    private val _isLoadingGeminiModels = MutableStateFlow(false)
+
     private val _snackbarMessages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val snackbarMessages = _snackbarMessages.asSharedFlow()
 
@@ -94,7 +99,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         val loadingFolders: Boolean,
         val driveError: String?,
         val selectedNotePath: String?,
-        val selectedTranscriptPath: String?
+        val selectedTranscriptPath: String?,
+        val availableModels: List<String>,
+        val loadingModels: Boolean
     )
 
     private val auxiliaryFlow = combine(
@@ -102,17 +109,25 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         _driveFolders,
         _isLoadingDriveFolders,
         _driveAuthError,
-        combine(_selectedNotePath, _selectedTranscriptPath) { notePath, transcriptPath ->
-            notePath to transcriptPath
+        combine(
+            _selectedNotePath,
+            _selectedTranscriptPath,
+            _availableGeminiModels,
+            _isLoadingGeminiModels
+        ) { notePath, transcriptPath, models, loadingModels ->
+            listOf(notePath, transcriptPath, models, loadingModels)
         }
-    ) { testState, folders, loadingFolders, authErr, selectionPair ->
+    ) { testState, folders, loadingFolders, authErr, extra ->
+        @Suppress("UNCHECKED_CAST")
         AuxiliaryState(
             geminiTest = testState,
             driveFolders = folders,
             loadingFolders = loadingFolders,
             driveError = authErr,
-            selectedNotePath = selectionPair.first,
-            selectedTranscriptPath = selectionPair.second
+            selectedNotePath = extra[0] as String?,
+            selectedTranscriptPath = extra[1] as String?,
+            availableModels = extra[2] as List<String>,
+            loadingModels = extra[3] as Boolean
         )
     }
 
@@ -201,7 +216,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             isLoadingDriveFolders = aux.loadingFolders,
             driveAuthError = aux.driveError,
             selectedNotePath = aux.selectedNotePath,
-            selectedTranscriptPath = aux.selectedTranscriptPath
+            selectedTranscriptPath = aux.selectedTranscriptPath,
+            availableGeminiModels = aux.availableModels,
+            isLoadingGeminiModels = aux.loadingModels
         )
     }.stateIn(
         scope = viewModelScope,
@@ -256,9 +273,30 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             result.onSuccess { msg ->
                 app.settingsRepo.setGeminiConfig(apiKey, cleanModel)
                 _geminiTestState.value = GeminiTestState.Success(msg)
+                app.geminiService.fetchAvailableModels(apiKey).onSuccess { models ->
+                    if (models.isNotEmpty()) _availableGeminiModels.value = models
+                }
             }.onFailure { err ->
                 _geminiTestState.value = GeminiTestState.Error(err.message ?: "Connection failed")
             }
+        }
+    }
+
+    fun fetchAvailableGeminiModels(apiKey: String) {
+        viewModelScope.launch {
+            _isLoadingGeminiModels.value = true
+            val result = app.geminiService.fetchAvailableModels(apiKey)
+            result.onSuccess { models ->
+                _availableGeminiModels.value = models
+                if (models.isEmpty()) {
+                    _snackbarMessages.emit("No generateContent models returned for this API key.")
+                } else {
+                    _snackbarMessages.emit("Loaded ${models.size} available model(s) for your key.")
+                }
+            }.onFailure { err ->
+                _snackbarMessages.emit(err.message ?: "Failed to load models")
+            }
+            _isLoadingGeminiModels.value = false
         }
     }
 

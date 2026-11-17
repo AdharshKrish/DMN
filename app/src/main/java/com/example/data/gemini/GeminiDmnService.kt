@@ -49,7 +49,7 @@ class GeminiDmnService(private val context: Context) {
         runCatching {
             val cleanKey = apiKey.trim()
             require(cleanKey.isNotBlank()) { "Please enter your Google AI Studio API key." }
-            val cleanModel = modelId.trim().ifBlank { "gemini-flash-latest" }
+            val cleanModel = modelId.trim().ifBlank { "gemini-3.8-flash" }
             val request = Request.Builder()
                 .url("$BASE_URL/v1beta/models/$cleanModel")
                 .header("x-goog-api-key", cleanKey)
@@ -69,6 +69,76 @@ class GeminiDmnService(private val context: Context) {
         }
     }
 
+    suspend fun fetchAvailableModels(apiKey: String): Result<List<String>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanKey = apiKey.trim()
+            require(cleanKey.isNotBlank()) { "Please enter your Google AI Studio API key first." }
+            val request = Request.Builder()
+                .url("$BASE_URL/v1beta/models?pageSize=100")
+                .header("x-goog-api-key", cleanKey)
+                .get()
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    val errDetail = parseGeminiErrorDetails(response.code, null, bodyStr)
+                    throw IOException("Could not list models — $errDetail")
+                }
+                parseAvailableModelsResponse(bodyStr)
+            }
+        }
+    }
+
+    fun parseAvailableModelsResponse(bodyStr: String): List<String> {
+        val root = JSONObject(bodyStr)
+        val arr = root.optJSONArray("models") ?: return emptyList()
+        val collected = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val rawName = obj.optString("name", "")
+            val id = rawName.removePrefix("models/").trim()
+            if (id.isBlank()) continue
+            val methods = obj.optJSONArray("supportedGenerationMethods")
+            var supportsGenerate = false
+            if (methods != null) {
+                for (m in 0 until methods.length()) {
+                    if (methods.optString(m) == "generateContent") {
+                        supportsGenerate = true
+                        break
+                    }
+                }
+            }
+            if (!supportsGenerate) continue
+            val lower = id.lowercase()
+            if (lower.contains("embedding") ||
+                lower.contains("imagen") ||
+                lower.contains("veo") ||
+                lower.contains("aqa") ||
+                lower.contains("tts") ||
+                lower.contains("robotics")
+            ) continue
+            collected.add(id)
+        }
+        val preferredOrder = listOf(
+            "gemini-3.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-flash-lite-latest",
+            "gemini-flash-latest"
+        )
+        return collected.distinct().sortedWith(
+            compareBy<String>(
+                { model ->
+                    val idx = preferredOrder.indexOf(model)
+                    if (idx >= 0) idx else Int.MAX_VALUE
+                },
+                { model -> if (model.contains("flash-lite", ignoreCase = true)) 0 else 1 },
+                { model -> if (model.contains("flash", ignoreCase = true)) 0 else 1 },
+                { model -> model }
+            )
+        )
+    }
+
     suspend fun processAudioToDmnMarkdown(
         apiKey: String,
         modelId: String,
@@ -83,7 +153,7 @@ class GeminiDmnService(private val context: Context) {
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
-        val cleanModel = modelId.trim().ifBlank { "gemini-flash-latest" }
+        val cleanModel = modelId.trim().ifBlank { "gemini-3.8-flash" }
 
         onStageChanged("UPLOADING")
         val uploaded = uploadAudioResumable(
@@ -140,7 +210,7 @@ class GeminiDmnService(private val context: Context) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
         require(rawText.isNotBlank()) { "Input text is empty." }
-        val cleanModel = modelId.trim().ifBlank { "gemini-flash-latest" }
+        val cleanModel = modelId.trim().ifBlank { "gemini-3.8-flash" }
 
         onStageChanged("SYNTHESIZING")
         val prompt = buildTextDmnPrompt(rawText, existingNodes, timestampStr)
@@ -338,10 +408,12 @@ class GeminiDmnService(private val context: Context) {
                         }
                         val elapsedSec = elapsedMs / 1000L
                         val attemptsNote = if (attempt > 1) " (failed after $attempt attempts over ${elapsedSec}s)" else ""
-                        val hint = if (response.code == 503 || response.code == 429) {
-                            "\nTip: Switch Gemini Model ID in Sync (e.g. gemini-2.5-flash) or retry shortly."
-                        } else {
-                            ""
+                        val hint = when {
+                            response.code == 503 || response.code == 429 ->
+                                "\nTip: Try gemini-3.5-flash-lite (lower load) or fetch live models for your key in Sync."
+                            details.contains("no longer available", ignoreCase = true) ->
+                                "\nTip: Switch to gemini-3.8-flash or gemini-3.5-flash-lite in Sync."
+                            else -> ""
                         }
                         throw IOException("Gemini generation error$attemptsNote — $details$hint")
                     }

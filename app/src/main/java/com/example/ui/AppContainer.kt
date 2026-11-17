@@ -230,6 +230,7 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                     onPickVaultFolder = { vaultPickerLauncher.launch(null) },
                                     onSaveGeminiConfig = viewModel::saveGeminiConfig,
                                     onTestGeminiConnection = viewModel::testGeminiConnection,
+                                    onFetchAvailableModels = viewModel::fetchAvailableGeminiModels,
                                     onAuthorizeDrive = viewModel::authorizeGoogleDrive,
                                     onRefreshDriveFolders = viewModel::loadDriveFolders,
                                     onSelectDriveFolder = viewModel::selectDriveFolder,

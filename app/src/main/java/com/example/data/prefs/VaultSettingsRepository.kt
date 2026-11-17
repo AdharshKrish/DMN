@@ -41,7 +41,7 @@ data class VaultSettings(
     val isDriveConfigured: Boolean get() = !driveConnectedEmail.isNullOrBlank() && !driveFolderId.isNullOrBlank()
 
     companion object {
-        const val DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+        const val DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
         const val DEFAULT_AUDIO_RETENTION_DAYS = 0 // 0 = Keep Forever
     }
 }

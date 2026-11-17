@@ -126,12 +126,25 @@ class ForceGraphAndPromptTest {
         assertTrue(formatted.contains("gemini-flash-latest"))
         assertTrue(formatted.contains("MODEL_OVERLOADED"))
 
-        val plainFallback = service.parseGeminiErrorDetails(502, "gemini-2.5-flash", "Bad Gateway HTML")
+        val plainFallback = service.parseGeminiErrorDetails(502, "gemini-3.8-flash", "Bad Gateway HTML")
         assertTrue(plainFallback.contains("HTTP 502"))
-        assertTrue(plainFallback.contains("gemini-2.5-flash"))
+        assertTrue(plainFallback.contains("gemini-3.8-flash"))
         assertTrue(plainFallback.contains("Bad Gateway HTML"))
         assertTrue(service.readTimeoutSeconds() >= 300L)
         assertTrue(GeminiDmnService.MAX_RETRY_WINDOW_MS >= 300_000L)
+
+        val modelsJson = """
+            {
+              "models": [
+                {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
+                {"name": "models/gemini-flash-latest", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.5-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.8-flash", "supportedGenerationMethods": ["generateContent"]}
+              ]
+            }
+        """.trimIndent()
+        val parsedModels = service.parseAvailableModelsResponse(modelsJson)
+        assertEquals(listOf("gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"), parsedModels)
     }
 
     @Test
