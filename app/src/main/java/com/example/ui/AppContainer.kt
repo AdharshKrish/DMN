@@ -188,6 +188,7 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                         viewModel.openNoteByPath(notePath)
                                         activeTab = AppDestination.VAULT
                                     },
+                                    onDeleteSession = viewModel::deleteSessionForJob,
                                     onClearCompletedJobs = viewModel::clearCompletedJobs,
                                     modifier = contentModifier
                                 )
@@ -220,6 +221,10 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                     },
                                     onToggleTask = viewModel::toggleTaskInNote,
                                     onTogglePlayAudio = viewModel::togglePlayArchivedAudio,
+                                    onDeleteSessionFromNote = viewModel::deleteSessionFromDailyNote,
+                                    onDeleteArchiveSession = { transcriptName, audioName ->
+                                        viewModel.deleteSessionForArchive(transcriptName, audioName)
+                                    },
                                     modifier = contentModifier
                                 )
                             }

@@ -55,6 +55,124 @@ class ObsidianVaultRepository(private val context: Context) {
                 parser.parse(stamp)?.time
             }.getOrNull()
         }
+
+        fun isDmnSessionHeading(line: String): Boolean {
+            val t = line.trim()
+            return t.startsWith("## ") && t.contains("DMN", ignoreCase = true)
+        }
+
+        data class SessionRemovalResult(
+            val removed: Boolean,
+            val remainingMarkdown: String?, // null means daily note has no sessions left and can be deleted
+            val referencedAudioNames: List<String>,
+            val referencedTranscriptNames: List<String>,
+            val matchedHeading: String?
+        )
+
+        fun removeDmnSessionFromMarkdown(
+            content: String,
+            sessionHeading: String? = null,
+            matchFileName: String? = null
+        ): SessionRemovalResult {
+            val lines = content.lines()
+            var bodyStartIdx = 0
+            if (lines.firstOrNull()?.trim() == "---") {
+                val fmEnd = lines.drop(1).indexOfFirst { it.trim() == "---" }
+                if (fmEnd >= 0) {
+                    bodyStartIdx = fmEnd + 2
+                }
+            }
+
+            // Include top H1 date heading (# YYYY-MM-DD or # 📅 YYYY-MM-DD) in headerPrefix if before first ---
+            var dividerSearchStart = bodyStartIdx
+            while (dividerSearchStart < lines.size && lines[dividerSearchStart].trim() != "---") {
+                dividerSearchStart++
+            }
+            val headerPrefix = lines.take(dividerSearchStart).joinToString("\n").trimEnd()
+            val afterHeader = lines.drop(dividerSearchStart)
+
+            // Split into session blocks separated by standalone --- lines
+            val blocks = mutableListOf<String>()
+            val current = mutableListOf<String>()
+            for (line in afterHeader) {
+                if (line.trim() == "---") {
+                    val joined = current.joinToString("\n").trim()
+                    if (joined.isNotEmpty()) blocks.add(joined)
+                    current.clear()
+                } else {
+                    current.add(line)
+                }
+            }
+            val lastJoined = current.joinToString("\n").trim()
+            if (lastJoined.isNotEmpty()) blocks.add(lastJoined)
+
+            if (blocks.isEmpty()) {
+                return SessionRemovalResult(
+                    removed = false,
+                    remainingMarkdown = content,
+                    referencedAudioNames = emptyList(),
+                    referencedTranscriptNames = emptyList(),
+                    matchedHeading = null
+                )
+            }
+
+            val cleanHeading = sessionHeading?.trim()?.takeIf { it.isNotBlank() }
+            val cleanFile = matchFileName?.substringAfterLast('/')?.trim()?.takeIf { it.isNotBlank() }
+            val cleanStem = cleanFile?.substringBeforeLast('.')?.takeIf { it.isNotBlank() }
+
+            val targetIdx = blocks.indexOfFirst { block ->
+                val firstHeading = block.lines().firstOrNull { it.trim().startsWith("## ") }?.trim()
+                val headingHit = cleanHeading != null && firstHeading != null &&
+                    firstHeading.equals(cleanHeading, ignoreCase = true)
+                val fileHit = cleanFile != null && block.contains(cleanFile, ignoreCase = true)
+                val stemHit = cleanStem != null && cleanStem.length >= 6 &&
+                    (EMBED_AUDIO_REGEX.findAll(block).any { it.groupValues[1].substringBeforeLast('.').equals(cleanStem, ignoreCase = true) } ||
+                        EMBED_TRANSCRIPT_REGEX.findAll(block).any { it.groupValues[1].substringBeforeLast('.').equals(cleanStem, ignoreCase = true) })
+                headingHit || fileHit || stemHit
+            }
+
+            if (targetIdx < 0) {
+                return SessionRemovalResult(
+                    removed = false,
+                    remainingMarkdown = content,
+                    referencedAudioNames = emptyList(),
+                    referencedTranscriptNames = emptyList(),
+                    matchedHeading = null
+                )
+            }
+
+            val removedBlock = blocks[targetIdx]
+            val audioNames = EMBED_AUDIO_REGEX.findAll(removedBlock)
+                .map { it.groupValues[1].trim() }
+                .distinct()
+                .toList()
+            val transcriptNames = EMBED_TRANSCRIPT_REGEX.findAll(removedBlock)
+                .map { it.groupValues[1].trim() }
+                .distinct()
+                .toList()
+            val matchedHeading = removedBlock.lines().firstOrNull { it.trim().startsWith("## ") }?.trim()
+
+            val remaining = blocks.toMutableList().apply { removeAt(targetIdx) }
+            val remainingMd = if (remaining.isEmpty()) {
+                null
+            } else {
+                buildString {
+                    if (headerPrefix.isNotBlank()) {
+                        append(headerPrefix)
+                        append("\n\n---\n")
+                    }
+                    append(remaining.joinToString("\n\n---\n"))
+                    append("\n")
+                }
+            }
+            return SessionRemovalResult(
+                removed = true,
+                remainingMarkdown = remainingMd,
+                referencedAudioNames = audioNames,
+                referencedTranscriptNames = transcriptNames,
+                matchedHeading = matchedHeading
+            )
+        }
     }
 
     fun getRootDocument(treeUriString: String?): DocumentFile? {
@@ -203,7 +321,7 @@ class ObsidianVaultRepository(private val context: Context) {
         treeUriString: String,
         rawText: String,
         sessionTitle: String,
-        originalExtension: String = "txt"
+        originalExtension: String = "md"
     ): Result<InboxTextFile> = withContext(Dispatchers.IO) {
         runCatching {
             val trimmedCheck = rawText.trim()
@@ -218,7 +336,7 @@ class ObsidianVaultRepository(private val context: Context) {
                 .replace(Regex("""\s+"""), "_")
                 .take(40)
                 .ifBlank { "Note" }
-            val ext = if (originalExtension.equals("md", ignoreCase = true)) "md" else "txt"
+            val ext = if (originalExtension.equals("txt", ignoreCase = true)) "txt" else "md"
             val desiredName = "${stamp}_${safeTitle}.$ext"
             val uniqueName = resolveUniqueFileName(inbox, desiredName)
             val mime = if (ext == "md") "text/markdown" else "text/plain"
@@ -282,7 +400,7 @@ class ObsidianVaultRepository(private val context: Context) {
                     append("type: daily-dmn\n")
                     append("tags:\n  - daily-note\n  - dmn\n")
                     append("---\n\n")
-                    append("# 📅 $dateStr\n")
+                    append("# $dateStr\n")
                 }
             } else {
                 existingText.trimEnd()
@@ -296,10 +414,10 @@ class ObsidianVaultRepository(private val context: Context) {
                     append("\n")
                 }
                 if (!archivedAudioName.isNullOrBlank()) {
-                    append("\n> 🎧 **Original Audio:** ![[$DIR_AUDIO_ARCHIVE/$archivedAudioName]]")
+                    append("\n> **Original Audio:** ![[$DIR_AUDIO_ARCHIVE/$archivedAudioName]]")
                 }
                 if (!archivedTranscriptName.isNullOrBlank()) {
-                    append("\n> 📝 **Exact Transcript:** ![[$DIR_TRANSCRIPT_ARCHIVE/$archivedTranscriptName]]")
+                    append("\n> **Transcript Archive:** ![[$DIR_TRANSCRIPT_ARCHIVE/$archivedTranscriptName]]")
                 }
                 append("\n")
             }
@@ -470,6 +588,110 @@ class ObsidianVaultRepository(private val context: Context) {
                 }
             }
             deletedCount
+        }
+    }
+
+    data class DeletedSessionArtifacts(
+        val deletedPaths: List<String>,
+        val audioNamesRemoved: List<String>,
+        val transcriptNamesRemoved: List<String>,
+        val dailyNoteDeletedCompletely: Boolean
+    )
+
+    suspend fun deleteCompleteDmnSession(
+        treeUriString: String,
+        dailyNotePath: String? = null,
+        sessionHeading: String? = null,
+        transcriptFileName: String? = null,
+        audioFileName: String? = null
+    ): Result<DeletedSessionArtifacts> = withContext(Dispatchers.IO) {
+        runCatching {
+            val root = getRootDocument(treeUriString)
+                ?: throw IllegalStateException("Vault folder is not accessible")
+
+            val deletedPaths = mutableListOf<String>()
+            val audioToDelete = linkedSetOf<String>()
+            val transcriptsToDelete = linkedSetOf<String>()
+            audioFileName?.substringAfterLast('/')?.trim()?.takeIf { it.isNotBlank() }?.let { audioToDelete.add(it) }
+            transcriptFileName?.substringAfterLast('/')?.trim()?.takeIf { it.isNotBlank() }?.let { transcriptsToDelete.add(it) }
+
+            val primaryMatchName = transcriptFileName ?: audioFileName
+            var dailyNoteDeletedCompletely = false
+
+            val dailyDocsToInspect = if (!dailyNotePath.isNullOrBlank()) {
+                val doc = findFileByRelativePath(treeUriString, dailyNotePath)
+                if (doc != null) listOf(dailyNotePath to doc) else emptyList()
+            } else if (primaryMatchName != null) {
+                root.findFile(DIR_DAILY_NOTES)
+                    ?.takeIf { it.isDirectory }
+                    ?.listFiles()
+                    ?.filter { it.isFile && it.name?.endsWith(".md", ignoreCase = true) == true }
+                    ?.mapNotNull { doc -> doc.name?.let { "$DIR_DAILY_NOTES/$it" to doc } }
+                    ?: emptyList()
+            } else {
+                emptyList()
+            }
+
+            for ((relPath, dailyDoc) in dailyDocsToInspect) {
+                val text = readDocumentText(dailyDoc.uri)
+                val removal = removeDmnSessionFromMarkdown(
+                    content = text,
+                    sessionHeading = sessionHeading,
+                    matchFileName = primaryMatchName ?: audioFileName
+                )
+                if (removal.removed) {
+                    audioToDelete.addAll(removal.referencedAudioNames)
+                    transcriptsToDelete.addAll(removal.referencedTranscriptNames)
+                    if (removal.remainingMarkdown == null) {
+                        if (dailyDoc.delete()) {
+                            deletedPaths.add(relPath)
+                            dailyNoteDeletedCompletely = true
+                        }
+                    } else {
+                        writeDocumentText(dailyDoc.uri, removal.remainingMarkdown)
+                    }
+                    if (!dailyNotePath.isNullOrBlank()) break
+                }
+            }
+
+            // Also derive companion stem (e.g. deleting transcript deletes same-stem audio & vice versa)
+            val stems = (audioToDelete + transcriptsToDelete)
+                .map { it.substringBeforeLast('.') }
+                .filter { it.length >= 6 }
+                .toSet()
+
+            val transcriptDir = root.findFile(DIR_TRANSCRIPT_ARCHIVE)?.takeIf { it.isDirectory }
+            val removedTranscripts = mutableListOf<String>()
+            transcriptDir?.listFiles()?.forEach { doc ->
+                val name = doc.name ?: return@forEach
+                val stem = name.substringBeforeLast('.')
+                if (transcriptsToDelete.any { it.equals(name, ignoreCase = true) } || stems.any { it.equals(stem, ignoreCase = true) }) {
+                    if (doc.delete()) {
+                        deletedPaths.add("$DIR_TRANSCRIPT_ARCHIVE/$name")
+                        removedTranscripts.add(name)
+                    }
+                }
+            }
+
+            val audioDir = root.findFile(DIR_AUDIO_ARCHIVE)?.takeIf { it.isDirectory }
+            val removedAudio = mutableListOf<String>()
+            audioDir?.listFiles()?.forEach { doc ->
+                val name = doc.name ?: return@forEach
+                val stem = name.substringBeforeLast('.')
+                if (audioToDelete.any { it.equals(name, ignoreCase = true) } || stems.any { it.equals(stem, ignoreCase = true) }) {
+                    if (doc.delete()) {
+                        deletedPaths.add("$DIR_AUDIO_ARCHIVE/$name")
+                        removedAudio.add(name)
+                    }
+                }
+            }
+
+            DeletedSessionArtifacts(
+                deletedPaths = deletedPaths.distinct(),
+                audioNamesRemoved = removedAudio.distinct(),
+                transcriptNamesRemoved = removedTranscripts.distinct(),
+                dailyNoteDeletedCompletely = dailyNoteDeletedCompletely
+            )
         }
     }
 

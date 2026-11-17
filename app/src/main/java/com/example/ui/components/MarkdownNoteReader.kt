@@ -26,7 +26,11 @@ import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.AudioFile
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -36,8 +40,12 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -55,6 +63,7 @@ import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.example.audio.AudioPlaybackState
+import com.example.data.vault.ObsidianVaultRepository
 import com.example.data.vault.VaultNote
 import com.example.ui.theme.JetBrainsMonoFontFamily
 import com.example.ui.theme.LocalSynapseColors
@@ -75,9 +84,11 @@ fun MarkdownNoteReader(
     onToggleTask: (lineIndex: Int) -> Unit,
     onTogglePlayAudio: (audioName: String) -> Unit,
     onOpenTranscript: (transcriptName: String) -> Unit = {},
+    onDeleteSession: ((sessionHeading: String) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val sem = LocalSynapseColors.current
+    var pendingSessionDelete by remember(note.relativePath) { mutableStateOf<String?>(null) }
     val lines = remember(note.content) { note.content.lines() }
     val bodyStartIdx = remember(lines) {
         if (lines.firstOrNull()?.trim() == "---") {
@@ -200,12 +211,35 @@ fun MarkdownNoteReader(
 
                     trimmed.startsWith("## ") -> {
                         Spacer(modifier = Modifier.height(6.dp))
-                        RichMarkdownText(
-                            text = trimmed.removePrefix("## "),
-                            baseStyle = MaterialTheme.typography.headlineSmall,
-                            baseColor = MaterialTheme.colorScheme.primary,
-                            onWikiLinkClick = onWikiLinkClick
-                        )
+                        val isDeletableSession = onDeleteSession != null &&
+                            note.folderType == ObsidianVaultRepository.DIR_DAILY_NOTES &&
+                            ObsidianVaultRepository.isDmnSessionHeading(trimmed)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RichMarkdownText(
+                                text = trimmed.removePrefix("## "),
+                                baseStyle = MaterialTheme.typography.headlineSmall,
+                                baseColor = MaterialTheme.colorScheme.primary,
+                                onWikiLinkClick = onWikiLinkClick,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (isDeletableSession) {
+                                IconButton(
+                                    onClick = { pendingSessionDelete = trimmed },
+                                    modifier = Modifier.testTag("delete_daily_session_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.DeleteOutline,
+                                        contentDescription = "Delete entire DMN session",
+                                        tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     trimmed.startsWith("### ") -> {
@@ -331,6 +365,38 @@ fun MarkdownNoteReader(
 
             item { Spacer(modifier = Modifier.height(24.dp)) }
         }
+    }
+
+    pendingSessionDelete?.let { heading ->
+        AlertDialog(
+            onDismissRequest = { pendingSessionDelete = null },
+            title = { Text("Delete This DMN Session?") },
+            text = {
+                Text(
+                    "Removes \"${heading.removePrefix("## ").trim()}\" from this Daily Note and permanently deletes its linked archived audio, transcript .md, and job record."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingSessionDelete = null
+                        onDeleteSession?.invoke(heading)
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("confirm_delete_daily_session_button")
+                ) {
+                    Text("Delete Everything")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingSessionDelete = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 

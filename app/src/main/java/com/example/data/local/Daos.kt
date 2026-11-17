@@ -19,6 +19,12 @@ interface ProcessingJobDao {
 
     @Query("DELETE FROM processing_jobs WHERE status = 'COMPLETED'")
     suspend fun clearCompleted()
+
+    @Query("DELETE FROM processing_jobs WHERE audioUri = :audioUri")
+    suspend fun deleteJobByUri(audioUri: String)
+
+    @Query("DELETE FROM processing_jobs WHERE archivedAudioName = :archivedName OR fileName = :fileName")
+    suspend fun deleteJobsByFileOrArchive(archivedName: String, fileName: String)
 }
 
 @Dao

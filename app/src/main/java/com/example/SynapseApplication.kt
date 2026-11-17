@@ -33,6 +33,7 @@ class SynapseApplication : Application() {
             driveAuthManager = driveAuthManager,
             driveSyncService = driveSyncService,
             jobDao = database.processingJobDao(),
+            syncRecordDao = database.syncRecordDao(),
             logDao = database.syncLogDao()
         )
     }

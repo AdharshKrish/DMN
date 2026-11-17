@@ -137,7 +137,11 @@ class GoogleDriveSyncService(
         onStatus: suspend (String) -> Unit = {}
     ): Result<DriveSyncSummary> = withContext(Dispatchers.IO) {
         runCatching {
-            log("INFO", "Starting two-way Google Drive sync...")
+            log(
+                level = "INFO",
+                message = "Starting two-way Google Drive sync...",
+                details = "Endpoint: $DRIVE_API\nDrive Target Folder ID: $driveRootFolderId\nConflict Strategy: ${conflictStrategy.name}"
+            )
             onStatus("Indexing local Obsidian vault...")
             val localFiles = vaultRepo.listAllSyncableFiles(vaultTreeUri)
                 .associateBy { it.relativePath }
@@ -248,7 +252,11 @@ class GoogleDriveSyncService(
                     }
                 } catch (e: Exception) {
                     errors++
-                    log("ERROR", "Sync failed for $path: ${e.message}")
+                    log(
+                        level = "ERROR",
+                        message = "Sync failed for $path: ${e.message}",
+                        details = "Path: $path\nDrive Folder ID: $driveRootFolderId\nEndpoint: $DRIVE_API\nError: ${e.javaClass.name}: ${e.message}"
+                    )
                 }
             }
 
@@ -260,8 +268,9 @@ class GoogleDriveSyncService(
                 errorCount = errors
             )
             log(
-                if (errors == 0) "SUCCESS" else "INFO",
-                "Sync complete: ↑$uploaded uploaded, ↓$downloaded downloaded, $conflicts conflicts, $unchanged unchanged"
+                level = if (errors == 0) "SUCCESS" else "INFO",
+                message = "Sync complete: $uploaded uploaded, $downloaded downloaded, $conflicts conflicts, $unchanged unchanged",
+                details = "Drive Root Folder ID: $driveRootFolderId\nUploaded: $uploaded\nDownloaded: $downloaded\nConflicts Resolved: $conflicts\nUnchanged: $unchanged\nErrors: $errors"
             )
             summary
         }
@@ -497,12 +506,13 @@ class GoogleDriveSyncService(
         )
     }
 
-    private suspend fun log(level: String, message: String) {
+    private suspend fun log(level: String, message: String, details: String? = null) {
         syncLogDao.insertLog(
             SyncLogEntity(
                 category = "DRIVE",
                 level = level,
-                message = message
+                message = message,
+                details = details
             )
         )
     }

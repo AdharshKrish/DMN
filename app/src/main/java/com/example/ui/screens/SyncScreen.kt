@@ -24,9 +24,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudSync
@@ -122,8 +126,10 @@ fun SyncScreen(
         mutableStateOf(state.settings.audioRetentionDays.toString())
     }
     var showApiKey by remember { mutableStateOf(false) }
+    var showDriveFolderPicker by remember { mutableStateOf(false) }
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var newDriveFolderName by remember { mutableStateOf("ObsidianVault") }
+    var selectedLog by remember { mutableStateOf<SyncLogEntity?>(null) }
     val signingDiagnostics = remember(context) {
         GoogleDriveAuthManager.readSigningDiagnostics(context)
     }
@@ -287,7 +293,7 @@ fun SyncScreen(
 
                     if (modelDraft.trim().startsWith("gemini-2.5", ignoreCase = true)) {
                         Text(
-                            text = "Note: gemini-2.5-* models are retired for new keys. Use gemini-3.8-flash or gemini-3.5-flash-lite.",
+                            text = "Note: gemini-2.5-* models are retired for new keys. Use gemini-3.5-flash or gemini-3.5-flash-lite.",
                             style = MaterialTheme.typography.labelSmall,
                             color = sem.amber
                         )
@@ -323,12 +329,13 @@ fun SyncScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         val fallbackPresets = listOf(
-                            "gemini-3.8-flash",
+                            "gemini-3.5-flash",
                             "gemini-3.5-flash-lite",
+                            "gemini-3.8-flash",
                             "gemini-flash-lite-latest",
                             "gemini-flash-latest"
                         )
-                        val modelPresets = (state.availableGeminiModels + fallbackPresets).distinct()
+                        val modelPresets = (fallbackPresets + state.availableGeminiModels).distinct()
                         modelPresets.forEach { preset ->
                             FilterChip(
                                 selected = modelDraft.trim() == preset,
@@ -463,70 +470,60 @@ fun SyncScreen(
                             }
                         }
 
-                        // Drive Folder Selection
-                        Row(
+                        // Compact Target Drive Folder Summary + Popup Picker Trigger
+                        Surface(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                         ) {
-                            Text(
-                                text = "Drive Target Folder",
-                                style = MaterialTheme.typography.titleSmall
-                            )
-                            Row {
-                                IconButton(
-                                    onClick = onRefreshDriveFolders,
-                                    modifier = Modifier.testTag("refresh_drive_folders_button")
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Icon(Icons.Outlined.Refresh, contentDescription = "Refresh Drive folders")
-                                }
-                                IconButton(
-                                    onClick = { showCreateFolderDialog = true },
-                                    modifier = Modifier.testTag("create_drive_folder_button")
-                                ) {
-                                    Icon(Icons.Outlined.CreateNewFolder, contentDescription = "Create Drive folder")
-                                }
-                            }
-                        }
-
-                        if (state.isLoadingDriveFolders) {
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        } else if (state.driveFolders.isEmpty()) {
-                            Text(
-                                text = "No folders loaded yet. Tap Refresh or Create Folder to set up \"ObsidianVault\" in Google Drive.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                state.driveFolders.take(8).forEach { folder ->
-                                    val selected = folder.id == state.settings.driveFolderId
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(MaterialTheme.shapes.small)
-                                            .clickable { onSelectDriveFolder(folder) }
-                                            .padding(horizontal = 8.dp, vertical = 4.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        RadioButton(
-                                            selected = selected,
-                                            onClick = { onSelectDriveFolder(folder) }
-                                        )
-                                        Icon(
-                                            imageVector = Icons.Outlined.Folder,
-                                            contentDescription = null,
-                                            tint = if (selected) sem.dailyBlue else MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
+                                    Icon(
+                                        imageVector = Icons.Outlined.Folder,
+                                        contentDescription = null,
+                                        tint = if (state.settings.isDriveConfigured) sem.dailyBlue else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Column {
                                         Text(
-                                            text = folder.name,
+                                            text = "Target Drive Folder",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = state.settings.driveFolderName?.takeIf { it.isNotBlank() }
+                                                ?: "Not selected yet",
                                             style = MaterialTheme.typography.bodyMedium,
+                                            color = if (state.settings.isDriveConfigured) {
+                                                MaterialTheme.colorScheme.onSurface
+                                            } else {
+                                                sem.amber
+                                            },
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        showDriveFolderPicker = true
+                                        if (state.driveFolders.isEmpty() && !state.isLoadingDriveFolders) {
+                                            onRefreshDriveFolders()
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("open_drive_folder_picker_button")
+                                ) {
+                                    Text(if (state.settings.isDriveConfigured) "Change" else "Choose")
                                 }
                             }
                         }
@@ -846,18 +843,128 @@ fun SyncScreen(
         // 6. Activity Log
         if (state.logs.isNotEmpty()) {
             item {
-                Text(
-                    text = "Activity & Sync Log",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = MaterialTheme.colorScheme.onBackground
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "Activity & Sync Log",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                    Text(
+                        text = "Tap any entry to inspect request endpoints, HTTP codes, and API response details.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            items(state.logs.take(20), key = { it.id }) { log ->
-                SyncLogRow(log = log)
+            items(state.logs.take(25), key = { it.id }) { log ->
+                SyncLogRow(
+                    log = log,
+                    onClick = { selectedLog = log }
+                )
             }
         }
 
         item { Spacer(modifier = Modifier.height(16.dp)) }
+    }
+
+    if (showDriveFolderPicker) {
+        AlertDialog(
+            onDismissRequest = { showDriveFolderPicker = false },
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Select Drive Folder",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Row {
+                        IconButton(
+                            onClick = onRefreshDriveFolders,
+                            modifier = Modifier.testTag("refresh_drive_folders_button")
+                        ) {
+                            Icon(Icons.Outlined.Refresh, contentDescription = "Refresh Drive folders")
+                        }
+                        IconButton(
+                            onClick = { showCreateFolderDialog = true },
+                            modifier = Modifier.testTag("create_drive_folder_button")
+                        ) {
+                            Icon(Icons.Outlined.CreateNewFolder, contentDescription = "Create Drive folder")
+                        }
+                    }
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (state.isLoadingDriveFolders) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    if (state.driveFolders.isEmpty() && !state.isLoadingDriveFolders) {
+                        Text(
+                            text = "No folders loaded yet. Tap Refresh or Create Folder to set up \"ObsidianVault\" in Google Drive.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            state.driveFolders.forEach { folder ->
+                                val selected = folder.id == state.settings.driveFolderId
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(MaterialTheme.shapes.small)
+                                        .clickable {
+                                            onSelectDriveFolder(folder)
+                                            showDriveFolderPicker = false
+                                        }
+                                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    RadioButton(
+                                        selected = selected,
+                                        onClick = {
+                                            onSelectDriveFolder(folder)
+                                            showDriveFolderPicker = false
+                                        }
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Outlined.Folder,
+                                        contentDescription = null,
+                                        tint = if (selected) sem.dailyBlue else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = folder.name,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showDriveFolderPicker = false }) {
+                    Text("Close")
+                }
+            }
+        )
     }
 
     if (showCreateFolderDialog) {
@@ -877,6 +984,7 @@ fun SyncScreen(
                 Button(
                     onClick = {
                         showCreateFolderDialog = false
+                        showDriveFolderPicker = false
                         onCreateDriveFolder(newDriveFolderName)
                     },
                     modifier = Modifier.testTag("confirm_create_drive_folder_button")
@@ -889,6 +997,16 @@ fun SyncScreen(
                     Text("Cancel")
                 }
             }
+        )
+    }
+
+    selectedLog?.let { logEntry ->
+        LogDetailDialog(
+            log = logEntry,
+            onCopy = { fullReport ->
+                copyToClipboard(context, "Log details", fullReport)
+            },
+            onDismiss = { selectedLog = null }
         )
     }
 }
@@ -923,7 +1041,10 @@ private fun ToggleRow(
 }
 
 @Composable
-private fun SyncLogRow(log: SyncLogEntity) {
+private fun SyncLogRow(
+    log: SyncLogEntity,
+    onClick: () -> Unit
+) {
     val sem = LocalSynapseColors.current
     val badgeColor = when (log.level) {
         "SUCCESS" -> sem.emerald
@@ -931,37 +1052,166 @@ private fun SyncLogRow(log: SyncLogEntity) {
         else -> sem.dailyBlue
     }
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(MaterialTheme.shapes.small)
+            .clickable(onClick = onClick)
+            .testTag("sync_log_row_${log.id}"),
         shape = MaterialTheme.shapes.small,
         color = MaterialTheme.colorScheme.surfaceContainerLow,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
         Row(
-            modifier = Modifier.padding(10.dp),
-            verticalAlignment = Alignment.Top,
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Box(
                 modifier = Modifier
-                    .padding(top = 4.dp)
                     .size(8.dp)
                     .clip(androidx.compose.foundation.shape.CircleShape)
                     .background(badgeColor)
             )
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "[${log.category}] ${formatRelativeTimestamp(log.timestampMs)}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "[${log.category}] ${formatRelativeTimestamp(log.timestampMs)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (!log.details.isNullOrBlank()) {
+                        Text(
+                            text = "Details",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
                 Text(
                     text = log.message,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                contentDescription = "Inspect log details",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp)
+            )
         }
     }
+}
+
+@Composable
+private fun LogDetailDialog(
+    log: SyncLogEntity,
+    onCopy: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val sem = LocalSynapseColors.current
+    val exactTimestamp = remember(log.timestampMs) {
+        SimpleDateFormat("MMM d, yyyy hh:mm:ss a", Locale.US).format(Date(log.timestampMs))
+    }
+    val levelColor = when (log.level) {
+        "SUCCESS" -> sem.emerald
+        "ERROR" -> sem.recordingCrimson
+        else -> sem.dailyBlue
+    }
+    val levelContainer = when (log.level) {
+        "SUCCESS" -> sem.emeraldContainer
+        "ERROR" -> MaterialTheme.colorScheme.errorContainer
+        else -> MaterialTheme.colorScheme.surfaceContainerHigh
+    }
+    val detailText = log.details?.takeIf { it.isNotBlank() }
+        ?: "No additional request/response details recorded for this log entry."
+    val fullReport = buildString {
+        appendLine("Timestamp: $exactTimestamp")
+        appendLine("Category: ${log.category}")
+        appendLine("Level: ${log.level}")
+        appendLine("Summary: ${log.message}")
+        appendLine()
+        append(detailText)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    StatusPill(
+                        label = log.category,
+                        color = MaterialTheme.colorScheme.primary,
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                    )
+                    StatusPill(
+                        label = log.level,
+                        color = levelColor,
+                        containerColor = levelContainer
+                    )
+                }
+                Text(
+                    text = exactTimestamp,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 380.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = log.message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = detailText,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onCopy(fullReport) },
+                modifier = Modifier.testTag("copy_log_details_button")
+            ) {
+                Icon(Icons.Outlined.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Copy Debug Report")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
 }
 
 @Composable

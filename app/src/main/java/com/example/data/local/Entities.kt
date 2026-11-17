@@ -45,5 +45,6 @@ data class SyncLogEntity(
     val timestampMs: Long = System.currentTimeMillis(),
     val category: String, // "GEMINI", "DRIVE", "VAULT"
     val level: String,    // "INFO", "SUCCESS", "ERROR"
-    val message: String
+    val message: String,
+    val details: String? = null
 )

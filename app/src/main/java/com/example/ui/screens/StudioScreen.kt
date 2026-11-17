@@ -53,6 +53,7 @@ import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Schedule
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -122,6 +123,7 @@ fun StudioScreen(
     onDeleteInboxText: (InboxTextFile) -> Unit,
     onRefreshInbox: () -> Unit,
     onOpenNote: (String) -> Unit,
+    onDeleteSession: (ProcessingJobEntity) -> Unit,
     onClearCompletedJobs: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -131,8 +133,9 @@ fun StudioScreen(
     var sessionLabel by remember { mutableStateOf("DMN") }
     var textTitle by rememberSaveable { mutableStateOf("") }
     var textBody by rememberSaveable { mutableStateOf("") }
-    var textExtension by rememberSaveable { mutableStateOf("txt") }
+    var textExtension by rememberSaveable { mutableStateOf("md") }
     var permissionDeniedNotice by remember { mutableStateOf(false) }
+    var jobPendingDelete by remember { mutableStateOf<ProcessingJobEntity?>(null) }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -424,12 +427,45 @@ fun StudioScreen(
             items(state.jobs.take(15), key = { it.audioUri }) { job ->
                 ProcessingJobCard(
                     job = job,
-                    onOpenNote = onOpenNote
+                    onOpenNote = onOpenNote,
+                    onRequestDelete = { jobPendingDelete = job }
                 )
             }
         }
 
         item { Spacer(modifier = Modifier.height(16.dp)) }
+    }
+
+    jobPendingDelete?.let { targetJob ->
+        AlertDialog(
+            onDismissRequest = { jobPendingDelete = null },
+            title = { Text("Delete DMN Session?") },
+            text = {
+                Text(
+                    "This will permanently delete \"${targetJob.fileName}\" along with its archived audio, transcript .md, Daily Note session entry, and history record."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        jobPendingDelete = null
+                        onDeleteSession(targetJob)
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("confirm_delete_job_session_button")
+                ) {
+                    Text("Delete Everything")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { jobPendingDelete = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
@@ -852,16 +888,16 @@ private fun TextNoteComposerCard(
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(
-                        selected = extension == "txt",
-                        onClick = { onExtensionChange("txt") },
-                        label = { Text(".txt") },
-                        modifier = Modifier.testTag("text_ext_txt")
-                    )
-                    FilterChip(
                         selected = extension == "md",
                         onClick = { onExtensionChange("md") },
                         label = { Text(".md") },
                         modifier = Modifier.testTag("text_ext_md")
+                    )
+                    FilterChip(
+                        selected = extension == "txt",
+                        onClick = { onExtensionChange("txt") },
+                        label = { Text(".txt") },
+                        modifier = Modifier.testTag("text_ext_txt")
                     )
                 }
 
@@ -1001,7 +1037,8 @@ private fun InboxTextCard(
 @Composable
 private fun ProcessingJobCard(
     job: ProcessingJobEntity,
-    onOpenNote: (String) -> Unit
+    onOpenNote: (String) -> Unit,
+    onRequestDelete: () -> Unit
 ) {
     val sem = LocalSynapseColors.current
     val status = runCatching { JobStatus.valueOf(job.status) }.getOrDefault(JobStatus.QUEUED)
@@ -1044,6 +1081,17 @@ private fun ProcessingJobCard(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 StatusPill(label = status.displayLabel, color = color, containerColor = bg, icon = icon)
+                IconButton(
+                    onClick = onRequestDelete,
+                    modifier = Modifier.testTag("delete_job_session_${job.fileName}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.DeleteOutline,
+                        contentDescription = "Delete entire DMN session",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
             }
 
             if (!job.errorMessage.isNullOrBlank()) {

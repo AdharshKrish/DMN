@@ -37,11 +37,13 @@ import androidx.compose.material.icons.outlined.Article
 import androidx.compose.material.icons.outlined.AudioFile
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.TaskAlt
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
@@ -96,11 +98,14 @@ fun VaultScreen(
     onCreateAtomicNote: (String) -> Unit,
     onToggleTask: (relativePath: String, lineIndex: Int) -> Unit,
     onTogglePlayAudio: (String) -> Unit,
+    onDeleteSessionFromNote: (dailyNotePath: String, sessionHeading: String) -> Unit,
+    onDeleteArchiveSession: (transcriptFileName: String?, audioFileName: String?) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf(VaultFilter.ALL) }
     var missingLinkPrompt by remember { mutableStateOf<String?>(null) }
+    var archivePendingDelete by remember { mutableStateOf<Pair<String?, String?>?>(null) }
 
     val sortedNotes = remember(state.graphData.notesByPath, searchQuery, filter) {
         if (filter == VaultFilter.ARCHIVES) {
@@ -168,6 +173,8 @@ fun VaultScreen(
                     onSelectNote = { onSelectNote(it.relativePath) },
                     onSelectTranscript = { onSelectTranscript(it.relativePath) },
                     onTogglePlayAudio = onTogglePlayAudio,
+                    onRequestDeleteTranscript = { archivePendingDelete = it.fileName to null },
+                    onRequestDeleteAudio = { archivePendingDelete = null to it.fileName },
                     modifier = Modifier
                         .weight(0.42f)
                         .fillMaxHeight()
@@ -183,7 +190,8 @@ fun VaultScreen(
                             ArchivedTranscriptViewer(
                                 transcript = activeTranscript,
                                 showBackButton = activeNote != null,
-                                onBack = { onSelectTranscript(null) }
+                                onBack = { onSelectTranscript(null) },
+                                onRequestDelete = { archivePendingDelete = activeTranscript.fileName to null }
                             )
                         }
                         activeNote != null -> {
@@ -195,7 +203,10 @@ fun VaultScreen(
                                 onWikiLinkClick = handleWikiLinkClick,
                                 onToggleTask = { lineIdx -> onToggleTask(activeNote.relativePath, lineIdx) },
                                 onTogglePlayAudio = onTogglePlayAudio,
-                                onOpenTranscript = onOpenTranscriptByName
+                                onOpenTranscript = onOpenTranscriptByName,
+                                onDeleteSession = { heading ->
+                                    onDeleteSessionFromNote(activeNote.relativePath, heading)
+                                }
                             )
                         }
                         else -> {
@@ -211,7 +222,8 @@ fun VaultScreen(
                     ArchivedTranscriptViewer(
                         transcript = activeTranscript,
                         showBackButton = true,
-                        onBack = { onSelectTranscript(null) }
+                        onBack = { onSelectTranscript(null) },
+                        onRequestDelete = { archivePendingDelete = activeTranscript.fileName to null }
                     )
                 }
                 activeNote != null -> {
@@ -224,7 +236,10 @@ fun VaultScreen(
                         onWikiLinkClick = handleWikiLinkClick,
                         onToggleTask = { lineIdx -> onToggleTask(activeNote.relativePath, lineIdx) },
                         onTogglePlayAudio = onTogglePlayAudio,
-                        onOpenTranscript = onOpenTranscriptByName
+                        onOpenTranscript = onOpenTranscriptByName,
+                        onDeleteSession = { heading ->
+                            onDeleteSessionFromNote(activeNote.relativePath, heading)
+                        }
                     )
                 }
                 else -> {
@@ -243,6 +258,8 @@ fun VaultScreen(
                         onSelectNote = { onSelectNote(it.relativePath) },
                         onSelectTranscript = { onSelectTranscript(it.relativePath) },
                         onTogglePlayAudio = onTogglePlayAudio,
+                        onRequestDeleteTranscript = { archivePendingDelete = it.fileName to null },
+                        onRequestDeleteAudio = { archivePendingDelete = null to it.fileName },
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -276,6 +293,39 @@ fun VaultScreen(
             }
         )
     }
+    if (archivePendingDelete != null) {
+        val (tName, aName) = archivePendingDelete!!
+        val label = tName ?: aName ?: "session"
+        AlertDialog(
+            onDismissRequest = { archivePendingDelete = null },
+            title = { Text("Delete Entire Session?") },
+            text = {
+                Text(
+                    "This will permanently delete \"$label\" and every linked artifact (Daily Note DMN entry, archived audio, transcript .md, and job record)."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        archivePendingDelete = null
+                        onDeleteArchiveSession(tName, aName)
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("confirm_delete_archive_session_button")
+                ) {
+                    Text("Delete Everything")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { archivePendingDelete = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -294,6 +344,8 @@ private fun VaultListPane(
     onSelectNote: (VaultNote) -> Unit,
     onSelectTranscript: (ArchivedTranscript) -> Unit,
     onTogglePlayAudio: (String) -> Unit,
+    onRequestDeleteTranscript: (ArchivedTranscript) -> Unit,
+    onRequestDeleteAudio: (ArchivedAudioItem) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val sem = LocalSynapseColors.current
@@ -369,7 +421,9 @@ private fun VaultListPane(
                 retentionDays = retentionDays,
                 selectedTranscriptPath = selectedTranscriptPath,
                 onSelectTranscript = onSelectTranscript,
-                onTogglePlayAudio = onTogglePlayAudio
+                onTogglePlayAudio = onTogglePlayAudio,
+                onRequestDeleteTranscript = onRequestDeleteTranscript,
+                onRequestDeleteAudio = onRequestDeleteAudio
             )
         } else if (notes.isEmpty()) {
             Box(
@@ -495,7 +549,9 @@ private fun ArchivesListContent(
     retentionDays: Int,
     selectedTranscriptPath: String?,
     onSelectTranscript: (ArchivedTranscript) -> Unit,
-    onTogglePlayAudio: (String) -> Unit
+    onTogglePlayAudio: (String) -> Unit,
+    onRequestDeleteTranscript: (ArchivedTranscript) -> Unit,
+    onRequestDeleteAudio: (ArchivedAudioItem) -> Unit
 ) {
     val sem = LocalSynapseColors.current
     if (archivedTranscripts.isEmpty() && archivedAudio.isEmpty()) {
@@ -594,19 +650,36 @@ private fun ArchivesListContent(
                             overflow = TextOverflow.Ellipsis
                         )
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            StatusPill(
-                                label = if (item.isFromAudio) "Voice Verbatim" else "Original Text",
-                                color = if (item.isFromAudio) sem.amber else sem.insightPurple,
-                                containerColor = if (item.isFromAudio) sem.amberContainer else sem.insightPurpleContainer
-                            )
-                            Text(
-                                text = formatBytes(item.sizeBytes),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                StatusPill(
+                                    label = if (item.isFromAudio) "Voice Clean" else "Original Note",
+                                    color = if (item.isFromAudio) sem.amber else sem.insightPurple,
+                                    containerColor = if (item.isFromAudio) sem.amberContainer else sem.insightPurpleContainer
+                                )
+                                Text(
+                                    text = formatBytes(item.sizeBytes),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            IconButton(
+                                onClick = { onRequestDeleteTranscript(item) },
+                                modifier = Modifier.testTag("delete_archived_transcript_${item.fileName}")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.DeleteOutline,
+                                    contentDescription = "Delete entire session",
+                                    tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -675,6 +748,17 @@ private fun ArchivesListContent(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                        IconButton(
+                            onClick = { onRequestDeleteAudio(audio) },
+                            modifier = Modifier.testTag("delete_archived_audio_${audio.fileName}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.DeleteOutline,
+                                contentDescription = "Delete entire session",
+                                tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                         Icon(
                             imageVector = Icons.Outlined.AudioFile,
                             contentDescription = null,
@@ -693,7 +777,8 @@ private fun ArchivesListContent(
 private fun ArchivedTranscriptViewer(
     transcript: ArchivedTranscript,
     showBackButton: Boolean,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onRequestDelete: () -> Unit
 ) {
     val context = LocalContext.current
     val sem = LocalSynapseColors.current
@@ -742,13 +827,23 @@ private fun ArchivedTranscriptViewer(
                     onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                         clipboard?.setPrimaryClip(ClipData.newPlainText(transcript.fileName, transcript.content))
-                        Toast.makeText(context, "Exact transcript copied", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Transcript copied", Toast.LENGTH_SHORT).show()
                     },
                     modifier = Modifier.testTag("copy_archived_transcript_button")
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.ContentCopy,
-                        contentDescription = "Copy exact transcript"
+                        contentDescription = "Copy transcript"
+                    )
+                }
+                IconButton(
+                    onClick = onRequestDelete,
+                    modifier = Modifier.testTag("delete_transcript_viewer_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.DeleteOutline,
+                        contentDescription = "Delete entire DMN session",
+                        tint = MaterialTheme.colorScheme.error
                     )
                 }
             }

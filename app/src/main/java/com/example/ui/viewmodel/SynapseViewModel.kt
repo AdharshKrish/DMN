@@ -362,7 +362,7 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
     fun submitTextToQueue(
         rawText: String,
         title: String,
-        extension: String = "txt",
+        extension: String = "md",
         processImmediately: Boolean
     ) {
         viewModelScope.launch {
@@ -408,6 +408,61 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             if (deleted) {
                 app.pipelineOrchestrator.refreshVaultAndInbox()
                 _snackbarMessages.emit("Removed ${item.name} from text inbox.")
+            }
+        }
+    }
+
+    fun deleteSessionForJob(job: ProcessingJobEntity) {
+        viewModelScope.launch {
+            val archived = job.archivedAudioName
+            val isTextArchive = archived?.endsWith(".md", ignoreCase = true) == true ||
+                archived?.endsWith(".txt", ignoreCase = true) == true
+            val res = app.pipelineOrchestrator.deleteCompleteSession(
+                dailyNotePath = job.outputNotePath,
+                transcriptFileName = if (isTextArchive) archived else archived?.let { "${it.substringBeforeLast('.')}.md" },
+                audioFileName = if (!isTextArchive) archived else null,
+                jobAudioUri = job.audioUri,
+                jobFileName = job.fileName
+            )
+            res.onSuccess { artifacts ->
+                _snackbarMessages.emit("Deleted session ${job.fileName} (${artifacts.deletedPaths.size} archive/note file(s) removed).")
+            }.onFailure { err ->
+                _snackbarMessages.emit(err.message ?: "Failed deleting session.")
+            }
+        }
+    }
+
+    fun deleteSessionFromDailyNote(dailyNotePath: String, sessionHeading: String) {
+        viewModelScope.launch {
+            val res = app.pipelineOrchestrator.deleteCompleteSession(
+                dailyNotePath = dailyNotePath,
+                sessionHeading = sessionHeading
+            )
+            res.onSuccess { artifacts ->
+                if (artifacts.dailyNoteDeletedCompletely && _selectedNotePath.value == dailyNotePath) {
+                    _selectedNotePath.value = null
+                }
+                _snackbarMessages.emit("Deleted DMN session and linked archives (${artifacts.deletedPaths.size} file(s)).")
+            }.onFailure { err ->
+                _snackbarMessages.emit(err.message ?: "Failed deleting DMN session.")
+            }
+        }
+    }
+
+    fun deleteSessionForArchive(transcriptFileName: String? = null, audioFileName: String? = null) {
+        viewModelScope.launch {
+            val res = app.pipelineOrchestrator.deleteCompleteSession(
+                transcriptFileName = transcriptFileName,
+                audioFileName = audioFileName
+            )
+            res.onSuccess { artifacts ->
+                if (transcriptFileName != null && _selectedTranscriptPath.value?.endsWith(transcriptFileName, ignoreCase = true) == true) {
+                    _selectedTranscriptPath.value = null
+                }
+                val name = transcriptFileName ?: audioFileName ?: "archive item"
+                _snackbarMessages.emit("Deleted $name and all linked session data (${artifacts.deletedPaths.size} file(s)).")
+            }.onFailure { err ->
+                _snackbarMessages.emit(err.message ?: "Failed deleting archive.")
             }
         }
     }

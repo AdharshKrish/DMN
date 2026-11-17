@@ -21,8 +21,15 @@ data class GeminiGenerationResult(
     val markdown: String,
     val rawTranscript: String,
     val modelUsed: String,
-    val extractedWikiLinks: List<String>
+    val extractedWikiLinks: List<String>,
+    val debugDetails: String = ""
 )
+
+class GeminiApiException(
+    message: String,
+    val debugDetails: String,
+    cause: Throwable? = null
+) : IOException(message, cause)
 
 class GeminiDmnService(private val context: Context) {
 
@@ -49,9 +56,10 @@ class GeminiDmnService(private val context: Context) {
         runCatching {
             val cleanKey = apiKey.trim()
             require(cleanKey.isNotBlank()) { "Please enter your Google AI Studio API key." }
-            val cleanModel = modelId.trim().ifBlank { "gemini-3.8-flash" }
+            val cleanModel = modelId.trim().ifBlank { "gemini-3.5-flash" }
+            val endpoint = "$BASE_URL/v1beta/models/$cleanModel"
             val request = Request.Builder()
-                .url("$BASE_URL/v1beta/models/$cleanModel")
+                .url(endpoint)
                 .header("x-goog-api-key", cleanKey)
                 .get()
                 .build()
@@ -60,7 +68,15 @@ class GeminiDmnService(private val context: Context) {
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     val errDetail = parseGeminiErrorDetails(response.code, cleanModel, bodyStr)
-                    throw IOException("API check failed — $errDetail")
+                    val debug = buildString {
+                        appendLine("Method: GET")
+                        appendLine("Endpoint: $endpoint")
+                        appendLine("Model: $cleanModel")
+                        appendLine("HTTP Status: ${response.code} ${response.message}")
+                        appendLine("Response Body:")
+                        append(bodyStr.ifBlank { "(empty)" })
+                    }
+                    throw GeminiApiException("API check failed — $errDetail", debug)
                 }
                 val json = JSONObject(bodyStr)
                 val displayName = json.optString("displayName", cleanModel)
@@ -121,6 +137,7 @@ class GeminiDmnService(private val context: Context) {
             collected.add(id)
         }
         val preferredOrder = listOf(
+            "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.8-flash",
             "gemini-flash-lite-latest",
@@ -153,7 +170,7 @@ class GeminiDmnService(private val context: Context) {
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
-        val cleanModel = modelId.trim().ifBlank { "gemini-3.8-flash" }
+        val cleanModel = modelId.trim().ifBlank { "gemini-3.5-flash" }
 
         onStageChanged("UPLOADING")
         val uploaded = uploadAudioResumable(
@@ -170,7 +187,7 @@ class GeminiDmnService(private val context: Context) {
 
             onStageChanged("SYNTHESIZING")
             val prompt = buildDmnPrompt(existingNodes, timestampStr)
-            val rawResponse = callGenerateContent(
+            val callOutput = callGenerateContent(
                 apiKey = cleanKey,
                 modelId = cleanModel,
                 fileUri = activeFile.uri,
@@ -179,7 +196,7 @@ class GeminiDmnService(private val context: Context) {
                 onStatusDetail = onStatusDetail
             )
 
-            val (verbatimTranscript, markdown) = parseAudioDualOutput(rawResponse)
+            val (cleanTranscript, markdown) = parseAudioDualOutput(callOutput.text)
             val links = WIKILINK_EXTRACT_REGEX.findAll(markdown)
                 .map { it.groupValues[1].trim() }
                 .filter { it.isNotBlank() }
@@ -188,9 +205,10 @@ class GeminiDmnService(private val context: Context) {
 
             GeminiGenerationResult(
                 markdown = markdown,
-                rawTranscript = verbatimTranscript,
+                rawTranscript = cleanTranscript,
                 modelUsed = cleanModel,
-                extractedWikiLinks = links
+                extractedWikiLinks = links,
+                debugDetails = callOutput.debugDetails
             )
         } finally {
             // Privacy rule from blueprint: delete temporary audio from Google servers immediately
@@ -210,11 +228,11 @@ class GeminiDmnService(private val context: Context) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
         require(rawText.isNotBlank()) { "Input text is empty." }
-        val cleanModel = modelId.trim().ifBlank { "gemini-3.8-flash" }
+        val cleanModel = modelId.trim().ifBlank { "gemini-3.5-flash" }
 
         onStageChanged("SYNTHESIZING")
         val prompt = buildTextDmnPrompt(rawText, existingNodes, timestampStr)
-        val rawResponse = callGenerateContent(
+        val callOutput = callGenerateContent(
             apiKey = cleanKey,
             modelId = cleanModel,
             fileUri = null,
@@ -223,7 +241,7 @@ class GeminiDmnService(private val context: Context) {
             onStatusDetail = onStatusDetail
         )
 
-        val cleanedMarkdown = cleanFences(rawResponse)
+        val cleanedMarkdown = cleanFences(callOutput.text)
         val links = WIKILINK_EXTRACT_REGEX.findAll(cleanedMarkdown)
             .map { it.groupValues[1].trim() }
             .filter { it.isNotBlank() }
@@ -234,7 +252,8 @@ class GeminiDmnService(private val context: Context) {
             markdown = cleanedMarkdown,
             rawTranscript = rawText,
             modelUsed = cleanModel,
-            extractedWikiLinks = links
+            extractedWikiLinks = links,
+            debugDetails = callOutput.debugDetails
         )
     }
 
@@ -338,6 +357,11 @@ class GeminiDmnService(private val context: Context) {
         throw IOException("Timed out waiting for Gemini audio file indexing.")
     }
 
+    private data class GenerateCallOutput(
+        val text: String,
+        val debugDetails: String
+    )
+
     private suspend fun callGenerateContent(
         apiKey: String,
         modelId: String,
@@ -345,7 +369,7 @@ class GeminiDmnService(private val context: Context) {
         mimeType: String?,
         prompt: String,
         onStatusDetail: (suspend (String) -> Unit)? = null
-    ): String {
+    ): GenerateCallOutput {
         val partsArray = JSONArray().apply {
             if (!fileUri.isNullOrBlank() && !mimeType.isNullOrBlank()) {
                 put(
@@ -373,6 +397,7 @@ class GeminiDmnService(private val context: Context) {
         }
 
         val payloadJson = payload.toString()
+        val endpointUrl = "$BASE_URL/v1beta/models/$modelId:generateContent"
         val startMs = System.currentTimeMillis()
         var attempt = 0
         var lastError: IOException? = null
@@ -380,7 +405,7 @@ class GeminiDmnService(private val context: Context) {
         while (true) {
             attempt++
             val request = Request.Builder()
-                .url("$BASE_URL/v1beta/models/$modelId:generateContent")
+                .url(endpointUrl)
                 .header("x-goog-api-key", apiKey)
                 .post(payloadJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
@@ -388,12 +413,12 @@ class GeminiDmnService(private val context: Context) {
             var retryWaitMs: Long? = null
             var retryStatusMsg: String? = null
 
-            val generatedText = try {
+            val callResult = try {
                 client.newCall(request).execute().use { response ->
                     val bodyStr = response.body?.string().orEmpty()
+                    val elapsedMs = System.currentTimeMillis() - startMs
                     if (!response.isSuccessful) {
                         val details = parseGeminiErrorDetails(response.code, modelId, bodyStr)
-                        val elapsedMs = System.currentTimeMillis() - startMs
                         val isTransient = response.code in TRANSIENT_HTTP_CODES
                         if (isTransient && elapsedMs < MAX_RETRY_WINDOW_MS) {
                             val rawBackoff = 5000L * (1L shl (attempt - 1).coerceAtMost(4))
@@ -410,12 +435,28 @@ class GeminiDmnService(private val context: Context) {
                         val attemptsNote = if (attempt > 1) " (failed after $attempt attempts over ${elapsedSec}s)" else ""
                         val hint = when {
                             response.code == 503 || response.code == 429 ->
-                                "\nTip: Try gemini-3.5-flash-lite (lower load) or fetch live models for your key in Sync."
+                                "\nTip: Try gemini-3.5-flash or gemini-3.5-flash-lite, or tap Load My Key's Models in Sync."
                             details.contains("no longer available", ignoreCase = true) ->
-                                "\nTip: Switch to gemini-3.8-flash or gemini-3.5-flash-lite in Sync."
+                                "\nTip: Switch to gemini-3.5-flash, gemini-3.8-flash, or gemini-3.5-flash-lite in Sync."
                             else -> ""
                         }
-                        throw IOException("Gemini generation error$attemptsNote — $details$hint")
+                        val debugReport = buildString {
+                            appendLine("Method: POST")
+                            appendLine("Endpoint: $endpointUrl")
+                            appendLine("Model: $modelId")
+                            appendLine("HTTP Status: ${response.code} ${response.message}")
+                            appendLine("Attempts: $attempt")
+                            appendLine("Elapsed: ${elapsedSec}s")
+                            appendLine("Input Type: ${mimeType ?: "text/plain"}")
+                            if (!fileUri.isNullOrBlank()) appendLine("Attached File URI: $fileUri")
+                            appendLine("Payload Size: ${payloadJson.length} chars")
+                            appendLine("Response Body:")
+                            append(bodyStr.take(4000).ifBlank { "(empty)" })
+                        }
+                        throw GeminiApiException(
+                            message = "Gemini generation error$attemptsNote — $details$hint",
+                            debugDetails = debugReport
+                        )
                     }
 
                     val json = JSONObject(bodyStr)
@@ -424,10 +465,20 @@ class GeminiDmnService(private val context: Context) {
                     val candidates = json.optJSONArray("candidates")
                     if (candidates == null || candidates.length() == 0) {
                         val feedbackStr = promptFeedback?.toString() ?: bodyStr.take(300)
-                        throw IOException(
-                            "Gemini returned no candidates [model=$modelId" +
+                        val debugReport = buildString {
+                            appendLine("Method: POST")
+                            appendLine("Endpoint: $endpointUrl")
+                            appendLine("Model: $modelId")
+                            appendLine("HTTP Status: ${response.code}")
+                            appendLine("Block Reason: ${blockReason ?: "none"}")
+                            appendLine("Response Body:")
+                            append(bodyStr.take(4000))
+                        }
+                        throw GeminiApiException(
+                            message = "Gemini returned no candidates [model=$modelId" +
                                 (if (blockReason != null) ", blockReason=$blockReason" else "") +
-                                "]. Response: $feedbackStr"
+                                "]. Response: $feedbackStr",
+                            debugDetails = debugReport
                         )
                     }
 
@@ -436,8 +487,9 @@ class GeminiDmnService(private val context: Context) {
                     val contentObj = firstCandidate.optJSONObject("content")
                     val parts = contentObj?.optJSONArray("parts")
                     if (parts == null || parts.length() == 0) {
-                        throw IOException(
-                            "Gemini returned empty content [model=$modelId, finishReason=$finishReason]. Response: ${bodyStr.take(300)}"
+                        throw GeminiApiException(
+                            message = "Gemini returned empty content [model=$modelId, finishReason=$finishReason]. Response: ${bodyStr.take(300)}",
+                            debugDetails = "Endpoint: POST $endpointUrl\nHTTP ${response.code}\nFinish Reason: $finishReason\nRaw Response:\n${bodyStr.take(4000)}"
                         )
                     }
 
@@ -448,20 +500,36 @@ class GeminiDmnService(private val context: Context) {
                     }.trim()
 
                     if (text.isEmpty()) {
-                        throw IOException(
-                            "Gemini returned blank text [model=$modelId, finishReason=$finishReason]."
+                        throw GeminiApiException(
+                            message = "Gemini returned blank text [model=$modelId, finishReason=$finishReason].",
+                            debugDetails = "Endpoint: POST $endpointUrl\nHTTP ${response.code}\nFinish Reason: $finishReason"
                         )
                     }
-                    text
+
+                    val usage = json.optJSONObject("usageMetadata")
+                    val debugReport = buildString {
+                        appendLine("Method: POST")
+                        appendLine("Endpoint: $endpointUrl")
+                        appendLine("Model: $modelId")
+                        appendLine("HTTP Status: ${response.code} OK")
+                        appendLine("Attempts: $attempt")
+                        appendLine("Duration: ${elapsedMs / 1000.0}s")
+                        appendLine("Finish Reason: ${finishReason.ifBlank { "STOP" }}")
+                        appendLine("Input Type: ${mimeType ?: "text/plain"}")
+                        if (usage != null) {
+                            appendLine(
+                                "Tokens — prompt=${usage.optInt("promptTokenCount")}, " +
+                                    "output=${usage.optInt("candidatesTokenCount")}, " +
+                                    "total=${usage.optInt("totalTokenCount")}"
+                            )
+                        }
+                        append("Output Characters: ${text.length}")
+                    }
+                    GenerateCallOutput(text = text, debugDetails = debugReport)
                 }
+            } catch (apiEx: GeminiApiException) {
+                throw apiEx
             } catch (ioe: IOException) {
-                val msg = ioe.message.orEmpty()
-                // Do not double-wrap errors we intentionally threw above
-                if (msg.startsWith("Gemini generation error") ||
-                    msg.startsWith("Gemini returned ")
-                ) {
-                    throw ioe
-                }
                 val elapsedMs = System.currentTimeMillis() - startMs
                 if (elapsedMs < MAX_RETRY_WINDOW_MS) {
                     val waitMs = 5000L.coerceAtMost((MAX_RETRY_WINDOW_MS - elapsedMs).coerceAtLeast(1000L))
@@ -470,14 +538,24 @@ class GeminiDmnService(private val context: Context) {
                     lastError = ioe
                     null
                 } else {
-                    throw IOException(
-                        "Gemini connection error after $attempt attempt(s) over ${elapsedMs / 1000L}s [model=$modelId]: ${ioe.javaClass.simpleName}: ${ioe.message}",
-                        ioe
+                    val debugReport = buildString {
+                        appendLine("Method: POST")
+                        appendLine("Endpoint: $endpointUrl")
+                        appendLine("Model: $modelId")
+                        appendLine("Attempts: $attempt")
+                        appendLine("Elapsed: ${elapsedMs / 1000L}s")
+                        appendLine("Exception: ${ioe.javaClass.name}: ${ioe.message}")
+                        lastError?.let { append("Last Transient Error: ${it.message}") }
+                    }
+                    throw GeminiApiException(
+                        message = "Gemini connection error after $attempt attempt(s) over ${elapsedMs / 1000L}s [model=$modelId]: ${ioe.javaClass.simpleName}: ${ioe.message}",
+                        debugDetails = debugReport,
+                        cause = ioe
                     )
                 }
             }
 
-            if (generatedText != null) return generatedText
+            if (callResult != null) return callResult
             retryStatusMsg?.let { onStatusDetail?.invoke(it) }
             retryWaitMs?.let { delay(it) }
         }
@@ -561,10 +639,15 @@ class GeminiDmnService(private val context: Context) {
         val dmnMarkdown = cleanFences(dmnMatch?.groupValues?.get(1) ?: rawResponse)
         val rawTranscript = rawMatch?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
             ?: run {
-                val cleanedSectionMarker = "### 🎙️ Stream of Consciousness (Cleaned)"
-                val idx = dmnMarkdown.indexOf(cleanedSectionMarker)
-                if (idx >= 0) {
-                    dmnMarkdown.substring(idx + cleanedSectionMarker.length).trim()
+                val markers = listOf(
+                    "### Stream of Consciousness (Cleaned)",
+                    "### 🎙️ Stream of Consciousness (Cleaned)"
+                )
+                val markerHit = markers.firstNotNullOfOrNull { marker ->
+                    dmnMarkdown.indexOf(marker).takeIf { it >= 0 }?.let { idx -> idx + marker.length }
+                }
+                if (markerHit != null) {
+                    dmnMarkdown.substring(markerHit).trim()
                 } else {
                     dmnMarkdown
                 }
@@ -580,57 +663,62 @@ class GeminiDmnService(private val context: Context) {
         }
 
         return """
-You are an elite Default Mode Network (DMN) cognitive synthesizer and personal knowledge graph architect for an Obsidian vault.
+You are an executive Default Mode Network (DMN) cognitive synthesizer and personal knowledge graph architect for an Obsidian vault.
 
 ### EXISTING KNOWLEDGE GRAPH NODES IN VAULT:
 $nodesContext
 
 ### YOUR TASK:
 Listen to the attached raw voice recording and produce TWO clearly delimited outputs:
-1. `<RAW_TRANSCRIPT>`: An exact, word-for-word verbatim transcription of everything spoken in the recording—preserving exact wording, filler words, pauses/false starts, and punctuation as faithfully as possible without rewriting or summarizing. Do NOT add WikiLinks inside `<RAW_TRANSCRIPT>`.
-2. `<DMN_MARKDOWN>`: A structured Obsidian Markdown entry following the rules below.
+1. `<RAW_TRANSCRIPT>`: A Gboard Rambler-grade clean prose transcript of the voice recording.
+   - Strip all filler vocalizations ("um", "uh", "er", "like", "you know"), stutters, false starts, accidental word/phrase repetitions, and spoken meta-instructions to the recorder (such as "scratch that", "ignore that part", or dictation commands — apply corrections seamlessly rather than transcribing the command itself).
+   - Preserve the speaker's exact voice, ideas, vocabulary, reasoning, and full substantive detail in clean, readable first-person prose paragraphs without summarizing away substance.
+   - Do NOT include `[[WikiLinks]]` or emojis inside `<RAW_TRANSCRIPT>`.
+2. `<DMN_MARKDOWN>`: A clean, professional Obsidian Markdown entry following the rules below.
+
+### STRICT FORMATTING RULE:
+- Do NOT use any emojis anywhere in `<RAW_TRANSCRIPT>` or `<DMN_MARKDOWN>` (zero icons in headings, bullets, tags, or body text). Keep the tone crisp, analytical, and professional.
 
 Rules for `<DMN_MARKDOWN>`:
-1. **PART 1: Rambler-Grade Clean Prose (`### 🎙️ Stream of Consciousness (Cleaned)`)**
-   - Act like Gboard Rambler at 99.9% accuracy: transform the natural, wandering spoken recording into clean, articulate, first-person ("I") written prose.
-   - Strip all filler words ("um", "uh", "like", "you know"), false starts, stutters, and accidental repetitions.
-   - Preserve my exact voice, emotional nuance, vocabulary, and depth of thought. Do NOT over-summarize or water down this section—keep the full richness of the monologue, broken into logical paragraphs.
-   - **Bi-Directional Graph Linking:** Whenever I mention a concept, person, project, recurring problem, or mental model that matches an item in the `EXISTING KNOWLEDGE GRAPH NODES` list (or warrants a new evergreen atomic topic node), naturally wrap it in Obsidian WikiLinks like `[[Concept Name]]` directly inline!
+1. **PART 1: Rambler-Grade Clean Prose (`### Stream of Consciousness (Cleaned)`)**
+   - Present the clean, articulate first-person ("I") prose version of the session, organized into logical paragraphs without filler words, repetitions, or dictation commands.
+   - Preserve full intellectual depth without over-summarizing.
+   - **Bi-Directional Graph Linking:** Whenever a concept, person, project, recurring problem, or mental model matches an item in `EXISTING KNOWLEDGE GRAPH NODES` (or warrants a new evergreen atomic topic node), naturally wrap it in Obsidian WikiLinks like `[[Concept Name]]` directly inline.
 
-2. **PART 2: DMN Cognitive Synthesis (`### 🧠 DMN Synthesis & Graph Connections`)**
-   Extract and structure the deeper mental connections from the monologue into four bulleted subsections:
-   - **💡 Core Realizations & Insights:** The breakthrough ideas or underlying truths uncovered during this session (with inline `[[WikiLinks]]`).
-   - **🔄 Past Solutions & Recognized Patterns:** How today's thoughts connect to past habits, previous problems, or historical solutions.
-   - **🎯 Future Goals & Next Actions:** Concrete, actionable next steps formatted as Obsidian tasks (`- [ ] Task description`).
-   - **🕸️ Suggested Graph Connections:** Explicitly list 3 to 6 `[[Node Name]]` hubs (existing or new) that this thought clusters around, and briefly state *why* they connect.
+2. **PART 2: DMN Cognitive Synthesis (`### DMN Synthesis & Graph Connections`)**
+   Structure the deeper synthesis into four subsections:
+   - **Core Realizations & Insights:** Breakthrough ideas or underlying truths uncovered during this session (with inline `[[WikiLinks]]`).
+   - **Past Solutions & Recognized Patterns:** How today's thoughts connect to past habits, previous problems, or historical solutions.
+   - **Future Goals & Next Actions:** Concrete, actionable next steps formatted as Obsidian tasks (`- [ ] Task description`).
+   - **Suggested Graph Connections:** Explicitly list 3 to 6 `[[Node Name]]` hubs (existing or new) that this thought clusters around, and briefly state why they connect.
 
 3. **PART 3: Inline Metadata Tags**
    - Provide a single line of relevant Obsidian tags at the top of the entry (e.g., `#dmn #journal #insight #architecture`).
 
-### OUTPUT FORMAT (Return BOTH XML-style blocks cleanly without outer code fences):
+### OUTPUT FORMAT (Return BOTH XML-style blocks cleanly without outer code fences and with zero emojis):
 <RAW_TRANSCRIPT>
-[Exact word-for-word verbatim transcription of the audio...]
+[Clean, Rambler-style first-person transcript without filler words, repetitions, dictation commands, WikiLinks, or emojis...]
 </RAW_TRANSCRIPT>
 
 <DMN_MARKDOWN>
-## 🕒 DMN Session — $timestampStr
+## DMN Session — $timestampStr
 **Tags:** #dmn [add 2-4 contextual #tags]
 **Linked Hubs:** [comma-separated list of top [[WikiLinks]] used]
 
-### 🧠 DMN Synthesis & Graph Connections
-**💡 Core Realizations & Insights**
+### DMN Synthesis & Graph Connections
+**Core Realizations & Insights**
 - ...
 
-**🔄 Past Solutions & Recognized Patterns**
+**Past Solutions & Recognized Patterns**
 - ...
 
-**🎯 Future Goals & Next Actions**
+**Future Goals & Next Actions**
 - [ ] ...
 
-**🕸️ Suggested Graph Connections**
-- [[Node A]] ↔ [[Node B]]: Explanation of connection...
+**Suggested Graph Connections**
+- [[Node A]] <-> [[Node B]]: Explanation of connection...
 
-### 🎙️ Stream of Consciousness (Cleaned)
+### Stream of Consciousness (Cleaned)
 [Full Rambler-cleaned first-person prose with natural inline [[WikiLinks]]...]
 </DMN_MARKDOWN>
         """.trimIndent()
@@ -644,7 +732,7 @@ Rules for `<DMN_MARKDOWN>`:
         }
 
         return """
-You are an elite Default Mode Network (DMN) cognitive synthesizer and personal knowledge graph architect for an Obsidian vault.
+You are an executive Default Mode Network (DMN) cognitive synthesizer and personal knowledge graph architect for an Obsidian vault.
 
 ### EXISTING KNOWLEDGE GRAPH NODES IN VAULT:
 $nodesContext
@@ -654,42 +742,45 @@ $nodesContext
 $rawText
 \"\"\"
 
+### STRICT FORMATTING RULE:
+- Do NOT use any emojis anywhere in your response (zero icons in headings, bullets, tags, or prose). Maintain a crisp, analytical, professional tone.
+
 ### YOUR TASK:
 Analyze the user's pasted transcript or written note above and output a structured Obsidian Markdown entry. Follow these exact rules:
 
-1. **PART 1: Structured Thought Prose (`### 📝 Captured Thought (Graph-Linked)`)**
-   - Preserve the user's full meaning, voice, nuance, and detail without over-summarizing. If the input is a rough transcript, polish clarity gently while retaining all ideas.
-   - **Bi-Directional Graph Linking:** Whenever the text mentions a concept, person, project, recurring problem, or mental model that matches an item in the `EXISTING KNOWLEDGE GRAPH NODES` list (or warrants a new evergreen atomic topic node), naturally wrap it in Obsidian WikiLinks like `[[Concept Name]]` directly inline!
+1. **PART 1: Structured Thought Prose (`### Captured Thought (Graph-Linked)`)**
+   - Preserve the user's full meaning, voice, nuance, and detail without over-summarizing. Clean up rough filler/repetitions gently if it is a rough transcript while retaining all ideas.
+   - **Bi-Directional Graph Linking:** Whenever the text mentions a concept, person, project, recurring problem, or mental model that matches an item in `EXISTING KNOWLEDGE GRAPH NODES` (or warrants a new evergreen atomic topic node), naturally wrap it in Obsidian WikiLinks like `[[Concept Name]]` directly inline.
 
-2. **PART 2: DMN Cognitive Synthesis (`### 🧠 DMN Synthesis & Graph Connections`)**
-   Extract and structure the deeper mental connections into four bulleted subsections:
-   - **💡 Core Realizations & Insights:** Breakthrough ideas or underlying truths uncovered (with inline `[[WikiLinks]]`).
-   - **🔄 Past Solutions & Recognized Patterns:** Connections to past habits, previous problems, or historical solutions.
-   - **🎯 Future Goals & Next Actions:** Concrete actionable next steps formatted as Obsidian tasks (`- [ ] Task description`).
-   - **🕸️ Suggested Graph Connections:** Explicitly list 3 to 6 `[[Node Name]]` hubs (existing or new) that this thought clusters around, and briefly state *why* they connect.
+2. **PART 2: DMN Cognitive Synthesis (`### DMN Synthesis & Graph Connections`)**
+   Structure the deeper synthesis into four subsections:
+   - **Core Realizations & Insights:** Breakthrough ideas or underlying truths uncovered (with inline `[[WikiLinks]]`).
+   - **Past Solutions & Recognized Patterns:** Connections to past habits, previous problems, or historical solutions.
+   - **Future Goals & Next Actions:** Concrete actionable next steps formatted as Obsidian tasks (`- [ ] Task description`).
+   - **Suggested Graph Connections:** Explicitly list 3 to 6 `[[Node Name]]` hubs (existing or new) that this thought clusters around, and briefly state why they connect.
 
 3. **PART 3: Inline Metadata Tags**
-   - Provide a single line of relevant Obsidian tags at the top of the entry (e.g., `#dmn #note #insight`).
+   - Provide a single line of relevant Obsidian tags at the top of the entry (e.g., `#dmn #text-input #insight`).
 
-### OUTPUT FORMAT (Valid Markdown Only, No Code Fences Wrapping the Response):
-## 🕒 DMN Note Session — $timestampStr
+### OUTPUT FORMAT (Valid Markdown Only, No Code Fences, Strictly Zero Emojis):
+## DMN Note Session — $timestampStr
 **Tags:** #dmn #text-input [add 2-4 contextual #tags]
 **Linked Hubs:** [comma-separated list of top [[WikiLinks]] used]
 
-### 🧠 DMN Synthesis & Graph Connections
-**💡 Core Realizations & Insights**
+### DMN Synthesis & Graph Connections
+**Core Realizations & Insights**
 - ...
 
-**🔄 Past Solutions & Recognized Patterns**
+**Past Solutions & Recognized Patterns**
 - ...
 
-**🎯 Future Goals & Next Actions**
+**Future Goals & Next Actions**
 - [ ] ...
 
-**🕸️ Suggested Graph Connections**
-- [[Node A]] ↔ [[Node B]]: Explanation of connection...
+**Suggested Graph Connections**
+- [[Node A]] <-> [[Node B]]: Explanation of connection...
 
-### 📝 Captured Thought (Graph-Linked)
+### Captured Thought (Graph-Linked)
 [Graph-linked prose preserving the full depth of the user's input with natural inline [[WikiLinks]]...]
         """.trimIndent()
     }

@@ -11,12 +11,14 @@ import androidx.work.WorkManager
 import com.example.data.drive.DriveSyncSummary
 import com.example.data.drive.GoogleDriveAuthManager
 import com.example.data.drive.GoogleDriveSyncService
+import com.example.data.gemini.GeminiApiException
 import com.example.data.gemini.GeminiDmnService
 import com.example.data.local.JobStatus
 import com.example.data.local.ProcessingJobDao
 import com.example.data.local.ProcessingJobEntity
 import com.example.data.local.SyncLogDao
 import com.example.data.local.SyncLogEntity
+import com.example.data.local.SyncRecordDao
 import com.example.data.prefs.VaultSettingsRepository
 import com.example.data.vault.ArchivedAudioItem
 import com.example.data.vault.ArchivedTranscript
@@ -48,6 +50,7 @@ class DmnPipelineOrchestrator(
     private val driveAuthManager: GoogleDriveAuthManager,
     private val driveSyncService: GoogleDriveSyncService,
     private val jobDao: ProcessingJobDao,
+    private val syncRecordDao: SyncRecordDao,
     private val logDao: SyncLogDao
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -100,7 +103,8 @@ class DmnPipelineOrchestrator(
                     SyncLogEntity(
                         category = "ARCHIVE",
                         level = "INFO",
-                        message = "Pruned $pruned expired audio file(s) older than ${settings.audioRetentionDays} day(s) from 99_Audio_Archive."
+                        message = "Pruned $pruned expired audio file(s) older than ${settings.audioRetentionDays} day(s) from 99_Audio_Archive.",
+                        details = "Retention Window: ${settings.audioRetentionDays} day(s)\nFolder: ${ObsidianVaultRepository.DIR_AUDIO_ARCHIVE}\nFiles Deleted: $pruned"
                     )
                 )
             }
@@ -155,13 +159,86 @@ class DmnPipelineOrchestrator(
                     SyncLogEntity(
                         category = "ARCHIVE",
                         level = "SUCCESS",
-                        message = "Manually pruned $count expired audio recording(s) older than ${settings.audioRetentionDays} day(s)."
+                        message = "Manually pruned $count expired audio recording(s) older than ${settings.audioRetentionDays} day(s).",
+                        details = "Retention Window: ${settings.audioRetentionDays} day(s)\nFolder: ${ObsidianVaultRepository.DIR_AUDIO_ARCHIVE}\nFiles Deleted: $count"
                     )
                 )
             }
             refreshVaultAndInbox()
         }
         return res
+    }
+
+    suspend fun deleteCompleteSession(
+        dailyNotePath: String? = null,
+        sessionHeading: String? = null,
+        transcriptFileName: String? = null,
+        audioFileName: String? = null,
+        jobAudioUri: String? = null,
+        jobFileName: String? = null
+    ): Result<ObsidianVaultRepository.DeletedSessionArtifacts> = processMutex.withLock {
+        val settings = settingsRepo.currentSettings()
+        val treeUri = settings.vaultTreeUri
+            ?: return@withLock Result.failure(IllegalStateException("Select your ObsidianVault folder first."))
+
+        val result = vaultRepo.deleteCompleteDmnSession(
+            treeUriString = treeUri,
+            dailyNotePath = dailyNotePath,
+            sessionHeading = sessionHeading,
+            transcriptFileName = transcriptFileName,
+            audioFileName = audioFileName
+        )
+
+        result.onSuccess { artifacts ->
+            if (!jobAudioUri.isNullOrBlank()) {
+                jobDao.deleteJobByUri(jobAudioUri)
+            }
+            val namesToMatch = (artifacts.audioNamesRemoved + artifacts.transcriptNamesRemoved +
+                listOfNotNull(audioFileName, transcriptFileName, jobFileName)).distinct()
+            namesToMatch.forEach { name ->
+                jobDao.deleteJobsByFileOrArchive(archivedName = name, fileName = name)
+            }
+            artifacts.deletedPaths.forEach { relPath ->
+                syncRecordDao.deleteByPath(relPath)
+            }
+            if (!dailyNotePath.isNullOrBlank() && artifacts.dailyNoteDeletedCompletely) {
+                syncRecordDao.deleteByPath(dailyNotePath)
+            }
+            val label = sessionHeading?.removePrefix("##")?.trim()
+                ?: transcriptFileName
+                ?: audioFileName
+                ?: jobFileName
+                ?: "DMN Session"
+            val summaryDetails = buildString {
+                appendLine("Session Target: $label")
+                if (!dailyNotePath.isNullOrBlank()) appendLine("Daily Note: $dailyNotePath (deletedCompletely=${artifacts.dailyNoteDeletedCompletely})")
+                appendLine("Deleted Vault Files (${artifacts.deletedPaths.size}):")
+                if (artifacts.deletedPaths.isEmpty()) {
+                    appendLine("  (session entry removed from daily note; no separate archive files matched)")
+                } else {
+                    artifacts.deletedPaths.forEach { appendLine("  - $it") }
+                }
+            }
+            logDao.insertLog(
+                SyncLogEntity(
+                    category = "VAULT",
+                    level = "INFO",
+                    message = "Deleted DMN session \"$label\" (${artifacts.deletedPaths.size} archive/note file(s) removed).",
+                    details = summaryDetails.trim()
+                )
+            )
+            refreshVaultAndInbox()
+        }.onFailure { err ->
+            logDao.insertLog(
+                SyncLogEntity(
+                    category = "VAULT",
+                    level = "ERROR",
+                    message = "Failed deleting DMN session: ${err.message}",
+                    details = err.stackTraceToString().take(2000)
+                )
+            )
+        }
+        result
     }
 
     fun enqueueBackgroundProcessing(triggerImmediateIfOnline: Boolean = true) {
@@ -278,7 +355,7 @@ class DmnPipelineOrchestrator(
                         sourceName = audio.name
                     ).getOrThrow()
 
-                    val transcriptFileName = "${archivedAudioName.substringBeforeLast('.')}.txt"
+                    val transcriptFileName = "${archivedAudioName.substringBeforeLast('.')}.md"
                     val archivedTranscriptName = vaultRepo.archiveRawTranscript(
                         treeUriString = treeUri,
                         rawText = generation.rawTranscript,
@@ -309,19 +386,37 @@ class DmnPipelineOrchestrator(
                         SyncLogEntity(
                             category = "GEMINI",
                             level = "SUCCESS",
-                            message = "Transcribed ${audio.name} -> $dailyPath + $archivedTranscriptName (${generation.extractedWikiLinks.size} WikiLinks via ${generation.modelUsed})"
+                            message = "Transcribed ${audio.name} -> $dailyPath + $archivedTranscriptName (${generation.extractedWikiLinks.size} WikiLinks via ${generation.modelUsed})",
+                            details = buildString {
+                                appendLine("Input Audio: ${audio.name} (${audio.sizeBytes} bytes, ${audio.mimeType})")
+                                appendLine("Daily Note: $dailyPath")
+                                appendLine("Archived Audio: ${ObsidianVaultRepository.DIR_AUDIO_ARCHIVE}/$archivedAudioName")
+                                appendLine("Archived Transcript: ${ObsidianVaultRepository.DIR_TRANSCRIPT_ARCHIVE}/$archivedTranscriptName")
+                                appendLine("WikiLinks (${generation.extractedWikiLinks.size}): $linksCsv")
+                                if (generation.debugDetails.isNotBlank()) {
+                                    appendLine("---")
+                                    append(generation.debugDetails)
+                                }
+                            }.trim()
                         )
                     )
                     processedCount++
                 } catch (e: Exception) {
                     val msg = e.message?.takeIf { it.isNotBlank() }
                         ?: "${e.javaClass.simpleName}: Failed processing ${audio.name}"
+                    val debug = (e as? GeminiApiException)?.debugDetails ?: buildString {
+                        appendLine("Input Audio: ${audio.name} (${audio.sizeBytes} bytes)")
+                        appendLine("Model: ${settings.geminiModel}")
+                        appendLine("Exception: ${e.javaClass.name}")
+                        append(e.stackTraceToString().take(2500))
+                    }.trim()
                     updateJob(audio.uri.toString(), audio.name, audio.sizeBytes, JobStatus.FAILED, msg, null, null, null, nowMs)
                     logDao.insertLog(
                         SyncLogEntity(
                             category = "GEMINI",
                             level = "ERROR",
-                            message = "${audio.name}: $msg"
+                            message = "${audio.name}: $msg",
+                            details = debug
                         )
                     )
                 }
@@ -358,11 +453,12 @@ class DmnPipelineOrchestrator(
                     )
 
                     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                    val preferredTranscriptName = if (Regex("""^\d{8}_\d{6}_.*""").matches(textFile.name)) {
-                        textFile.name
+                    val stemWithStamp = if (Regex("""^\d{8}_\d{6}_.*""").matches(textFile.name)) {
+                        textFile.name.substringBeforeLast('.')
                     } else {
-                        "${stamp}_${textFile.name}"
+                        "${stamp}_${textFile.name.substringBeforeLast('.')}"
                     }
+                    val preferredTranscriptName = "$stemWithStamp.md"
                     val archivedTranscriptName = vaultRepo.archiveRawTranscript(
                         treeUriString = treeUri,
                         rawText = rawText,
@@ -394,19 +490,36 @@ class DmnPipelineOrchestrator(
                         SyncLogEntity(
                             category = "GEMINI",
                             level = "SUCCESS",
-                            message = "Synthesized text ${textFile.name} -> $dailyPath + $archivedTranscriptName (${generation.extractedWikiLinks.size} WikiLinks via ${generation.modelUsed})"
+                            message = "Synthesized text ${textFile.name} -> $dailyPath + $archivedTranscriptName (${generation.extractedWikiLinks.size} WikiLinks via ${generation.modelUsed})",
+                            details = buildString {
+                                appendLine("Input Text Note: ${textFile.name} (${textFile.sizeBytes} bytes)")
+                                appendLine("Daily Note: $dailyPath")
+                                appendLine("Archived Markdown: ${ObsidianVaultRepository.DIR_TRANSCRIPT_ARCHIVE}/$archivedTranscriptName")
+                                appendLine("WikiLinks (${generation.extractedWikiLinks.size}): $linksCsv")
+                                if (generation.debugDetails.isNotBlank()) {
+                                    appendLine("---")
+                                    append(generation.debugDetails)
+                                }
+                            }.trim()
                         )
                     )
                     processedCount++
                 } catch (e: Exception) {
                     val msg = e.message?.takeIf { it.isNotBlank() }
                         ?: "${e.javaClass.simpleName}: Failed processing ${textFile.name}"
+                    val debug = (e as? GeminiApiException)?.debugDetails ?: buildString {
+                        appendLine("Input Text Note: ${textFile.name} (${textFile.sizeBytes} bytes)")
+                        appendLine("Model: ${settings.geminiModel}")
+                        appendLine("Exception: ${e.javaClass.name}")
+                        append(e.stackTraceToString().take(2500))
+                    }.trim()
                     updateJob(textFile.uri.toString(), textFile.name, textFile.sizeBytes, JobStatus.FAILED, msg, null, null, null, nowMs)
                     logDao.insertLog(
                         SyncLogEntity(
                             category = "GEMINI",
                             level = "ERROR",
-                            message = "${textFile.name}: $msg"
+                            message = "${textFile.name}: $msg",
+                            details = debug
                         )
                     )
                 }
@@ -451,7 +564,12 @@ class DmnPipelineOrchestrator(
                 SyncLogEntity(
                     category = "DRIVE",
                     level = "ERROR",
-                    message = e.message ?: "Drive sync failed"
+                    message = e.message ?: "Drive sync failed",
+                    details = buildString {
+                        appendLine("Drive Root Folder ID: $folderId")
+                        appendLine("Exception: ${e.javaClass.name}")
+                        append(e.stackTraceToString().take(2000))
+                    }.trim()
                 )
             )
             Result.failure(e)

@@ -139,12 +139,79 @@ class ForceGraphAndPromptTest {
                 {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
                 {"name": "models/gemini-flash-latest", "supportedGenerationMethods": ["generateContent"]},
                 {"name": "models/gemini-3.5-flash-lite", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-3.8-flash", "supportedGenerationMethods": ["generateContent"]}
+                {"name": "models/gemini-3.8-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.5-flash", "supportedGenerationMethods": ["generateContent"]}
               ]
             }
         """.trimIndent()
         val parsedModels = service.parseAvailableModelsResponse(modelsJson)
-        assertEquals(listOf("gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"), parsedModels)
+        assertEquals(
+            listOf("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"),
+            parsedModels
+        )
+    }
+
+    @Test
+    fun `gemini prompts enforce zero emojis and rambler clean prose`() {
+        val service = GeminiDmnService(ApplicationProvider.getApplicationContext())
+        val audioPrompt = service.buildDmnPrompt(listOf("Focus"), "10:00 AM")
+        val textPrompt = service.buildTextDmnPrompt("My draft note", listOf("Focus"), "10:05 AM")
+
+        assertTrue(audioPrompt.contains("Rambler", ignoreCase = true))
+        assertTrue(audioPrompt.contains("Do NOT use any emojis"))
+        assertTrue(textPrompt.contains("Do NOT use any emojis"))
+
+        val bannedEmojis = listOf("🕒", "🧠", "🎙️", "💡", "📝", "📅", "✨", "🎯")
+        bannedEmojis.forEach { emoji ->
+            assertFalse("Audio prompt should not contain $emoji", audioPrompt.contains(emoji))
+            assertFalse("Text prompt should not contain $emoji", textPrompt.contains(emoji))
+        }
+    }
+
+    @Test
+    fun `removeDmnSessionFromMarkdown strips targeted block and extracts archive references`() {
+        val sampleDaily = """
+            |---
+            |date: 2026-11-16
+            |type: dmn-daily-note
+            |---
+            |
+            |# 2026-11-16
+            |
+            |---
+            |## DMN Session — 09:00 AM
+            |**Tags:** #dmn
+            |> **Original Audio:** ![[99_Audio_Archive/20261116_090000_first.m4a]]
+            |> **Transcript Archive:** ![[98_Transcript_Archive/20261116_090000_first.md]]
+            |
+            |First session content.
+            |
+            |---
+            |## DMN Note Session — 11:30 AM
+            |**Tags:** #dmn #text-input
+            |> **Transcript Archive:** ![[98_Transcript_Archive/20261116_113000_second.md]]
+            |
+            |Second session content.
+        """.trimMargin()
+
+        val firstRemoval = ObsidianVaultRepository.removeDmnSessionFromMarkdown(
+            content = sampleDaily,
+            sessionHeading = "## DMN Session — 09:00 AM"
+        )
+        assertTrue(firstRemoval.removed)
+        assertNotNull(firstRemoval.remainingMarkdown)
+        assertEquals(listOf("20261116_090000_first.m4a"), firstRemoval.referencedAudioNames)
+        assertEquals(listOf("20261116_090000_first.md"), firstRemoval.referencedTranscriptNames)
+        assertFalse(firstRemoval.remainingMarkdown!!.contains("09:00 AM"))
+        assertTrue(firstRemoval.remainingMarkdown!!.contains("## DMN Note Session — 11:30 AM"))
+
+        val secondRemoval = ObsidianVaultRepository.removeDmnSessionFromMarkdown(
+            content = firstRemoval.remainingMarkdown!!,
+            matchFileName = "20261116_113000_second.md"
+        )
+        assertTrue(secondRemoval.removed)
+        assertNull(secondRemoval.remainingMarkdown)
+        assertEquals(listOf("20261116_113000_second.md"), secondRemoval.referencedTranscriptNames)
     }
 
     @Test
