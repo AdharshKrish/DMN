@@ -6,13 +6,16 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.example.data.drive.DriveSyncSummary
 import com.example.data.drive.GoogleDriveAuthManager
 import com.example.data.drive.GoogleDriveSyncService
 import com.example.data.gemini.GeminiApiException
 import com.example.data.gemini.GeminiDmnService
+import com.example.data.gemini.GeminiStepUpdate
 import com.example.data.local.JobStatus
 import com.example.data.local.ProcessingJobDao
 import com.example.data.local.ProcessingJobEntity
@@ -31,8 +34,11 @@ import com.example.worker.DriveSyncWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -41,6 +47,34 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+
+enum class StepStatus {
+    PENDING,
+    IN_PROGRESS,
+    RETRYING,
+    COMPLETED,
+    FAILED
+}
+
+data class PipelineStepProgress(
+    val id: String,
+    val title: String,
+    val detail: String,
+    val status: StepStatus = StepStatus.PENDING
+)
+
+data class ActiveProcessingProgress(
+    val fileName: String,
+    val inputKind: String,
+    val modelId: String,
+    val currentApiCall: String,
+    val currentStatusText: String,
+    val isRetrying: Boolean = false,
+    val attemptNumber: Int = 1,
+    val lastHttpStatusOrError: String? = null,
+    val steps: List<PipelineStepProgress> = emptyList(),
+    val startedAtMs: Long = System.currentTimeMillis()
+)
 
 class DmnPipelineOrchestrator(
     private val context: Context,
@@ -80,6 +114,12 @@ class DmnPipelineOrchestrator(
 
     private val _liveStatusMessage = MutableStateFlow<String?>(null)
     val liveStatusMessage: StateFlow<String?> = _liveStatusMessage.asStateFlow()
+
+    private val _activeProcessingProgress = MutableStateFlow<ActiveProcessingProgress?>(null)
+    val activeProcessingProgress: StateFlow<ActiveProcessingProgress?> = _activeProcessingProgress.asStateFlow()
+
+    private val _completionMessages = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    val completionMessages: SharedFlow<String> = _completionMessages.asSharedFlow()
 
     suspend fun refreshVaultAndInbox() {
         val settings = settingsRepo.currentSettings()
@@ -241,17 +281,30 @@ class DmnPipelineOrchestrator(
         result
     }
 
-    fun enqueueBackgroundProcessing(triggerImmediateIfOnline: Boolean = true) {
+    fun enqueueBackgroundProcessing(
+        triggerImmediateIfOnline: Boolean = true,
+        singleTargetUri: String? = null
+    ) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
-        val request = OneTimeWorkRequestBuilder<DmnProcessWorker>()
+        val builder = OneTimeWorkRequestBuilder<DmnProcessWorker>()
             .setConstraints(constraints)
-            .build()
+        if (triggerImmediateIfOnline) {
+            builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+        }
+        if (!singleTargetUri.isNullOrBlank()) {
+            builder.setInputData(workDataOf(DmnProcessWorker.KEY_SINGLE_TARGET_URI to singleTargetUri))
+        }
+        val policy = when {
+            !singleTargetUri.isNullOrBlank() -> ExistingWorkPolicy.APPEND_OR_REPLACE
+            triggerImmediateIfOnline -> ExistingWorkPolicy.KEEP
+            else -> ExistingWorkPolicy.KEEP
+        }
         WorkManager.getInstance(context).enqueueUniqueWork(
             "dmn_audio_processing",
-            if (triggerImmediateIfOnline) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
-            request
+            policy,
+            builder.build()
         )
     }
 
@@ -280,25 +333,31 @@ class DmnPipelineOrchestrator(
             .build()
         val request = OneTimeWorkRequestBuilder<DriveSyncWorker>()
             .setConstraints(constraints)
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .build()
         WorkManager.getInstance(context).enqueueUniqueWork(
             "manual_drive_sync",
-            ExistingWorkPolicy.REPLACE,
+            ExistingWorkPolicy.KEEP,
             request
         )
     }
 
-    suspend fun processInboxQueue(singleTargetUri: String? = null): Result<Int> = processMutex.withLock {
+    suspend fun processInboxQueue(
+        singleTargetUri: String? = null,
+        awaitAutoSync: Boolean = false
+    ): Result<Int> {
         val settings = settingsRepo.currentSettings()
-        val treeUri = settings.vaultTreeUri
-            ?: return@withLock Result.failure(IllegalStateException("Select your ObsidianVault folder first."))
-        if (settings.geminiApiKey.isBlank()) {
-            return@withLock Result.failure(IllegalStateException("Enter your Google AI Studio API key first."))
-        }
-
-        _isProcessing.value = true
         var processedCount = 0
-        try {
+        var shouldAutoSync = false
+        val queueResult = processMutex.withLock {
+            val treeUri = settings.vaultTreeUri
+                ?: return@withLock Result.failure<Int>(IllegalStateException("Select your ObsidianVault folder first."))
+            if (settings.geminiApiKey.isBlank()) {
+                return@withLock Result.failure<Int>(IllegalStateException("Enter your Google AI Studio API key first."))
+            }
+
+            _isProcessing.value = true
+            try {
             vaultRepo.ensureRequiredFolders(treeUri)
             val allAudio = vaultRepo.listInboxAudioFiles(treeUri)
             val allText = vaultRepo.listInboxTextFiles(treeUri)
@@ -325,6 +384,23 @@ class DmnPipelineOrchestrator(
                 try {
                     updateJob(audio.uri.toString(), audio.name, audio.sizeBytes, JobStatus.UPLOADING, null, null, null, null, nowMs)
                     _liveStatusMessage.value = "Uploading ${audio.name}..."
+                    _activeProcessingProgress.value = ActiveProcessingProgress(
+                        fileName = audio.name,
+                        inputKind = "Voice Audio",
+                        modelId = settings.geminiModel,
+                        currentApiCall = "Local SAF Scan (${existingNodes.size} graph nodes indexed)",
+                        currentStatusText = "Preparing audio upload to Gemini Files API...",
+                        steps = listOf(
+                            PipelineStepProgress("scan_graph", "Index Knowledge Graph", "Loaded ${existingNodes.size} existing [[WikiLink]] hubs", StepStatus.COMPLETED),
+                            PipelineStepProgress("upload_start", "Initiate Resumable Upload", "POST /upload/v1beta/files (start)", StepStatus.PENDING),
+                            PipelineStepProgress("upload_bytes", "Stream Audio Payload", "Streaming ${audio.sizeBytes / 1024} KB (${audio.mimeType})", StepStatus.PENDING),
+                            PipelineStepProgress("file_active", "Index Audio Remotely", "Waiting for Gemini Files state=ACTIVE", StepStatus.PENDING),
+                            PipelineStepProgress("generate", "Gemini DMN Synthesis", "POST /v1beta/models/${settings.geminiModel}:generateContent", StepStatus.PENDING),
+                            PipelineStepProgress("cleanup_remote", "Clean Temporary Remote File", "DELETE /v1beta/files/{id}", StepStatus.PENDING),
+                            PipelineStepProgress("save_vault", "Save Daily Note & Archives", "Write 99_Audio_Archive, 98_Transcript_Archive (.md), 01_Daily_Notes", StepStatus.PENDING)
+                        ),
+                        startedAtMs = nowMs
+                    )
 
                     val timeStr = SimpleDateFormat("hh:mm a", Locale.US).format(Date())
                     val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
@@ -346,7 +422,17 @@ class DmnPipelineOrchestrator(
                         },
                         onStatusDetail = { detail ->
                             _liveStatusMessage.value = "${audio.name}: $detail"
+                        },
+                        onStepUpdate = { update ->
+                            applyGeminiStepUpdate(update)
                         }
+                    )
+
+                    applyVaultStep(
+                        stepId = "save_vault",
+                        apiCall = "SAF DocumentFile Write (Local ObsidianVault)",
+                        statusText = "Archiving audio, writing .md transcript & Daily Note...",
+                        status = StepStatus.IN_PROGRESS
                     )
 
                     val archivedAudioName = vaultRepo.archiveProcessedAudio(
@@ -369,6 +455,13 @@ class DmnPipelineOrchestrator(
                         archivedAudioName = archivedAudioName,
                         archivedTranscriptName = archivedTranscriptName
                     ).getOrThrow()
+
+                    applyVaultStep(
+                        stepId = "save_vault",
+                        apiCall = "Saved $dailyPath + $archivedTranscriptName",
+                        statusText = "Completed ($archivedTranscriptName & $dailyPath)",
+                        status = StepStatus.COMPLETED
+                    )
 
                     val linksCsv = generation.extractedWikiLinks.joinToString(", ")
                     updateJob(
@@ -428,9 +521,29 @@ class DmnPipelineOrchestrator(
                 try {
                     updateJob(textFile.uri.toString(), textFile.name, textFile.sizeBytes, JobStatus.SYNTHESIZING, null, null, null, null, nowMs)
                     _liveStatusMessage.value = "Synthesizing ${textFile.name}..."
+                    _activeProcessingProgress.value = ActiveProcessingProgress(
+                        fileName = textFile.name,
+                        inputKind = "Text Note",
+                        modelId = settings.geminiModel,
+                        currentApiCall = "Reading local note ${textFile.name}",
+                        currentStatusText = "Loading text input from 04_Text_Inbox...",
+                        steps = listOf(
+                            PipelineStepProgress("scan_graph", "Index Knowledge Graph", "Loaded ${existingNodes.size} existing [[WikiLink]] hubs", StepStatus.COMPLETED),
+                            PipelineStepProgress("read_input", "Load Text Input", "Reading ${textFile.name} (${textFile.sizeBytes} bytes)", StepStatus.IN_PROGRESS),
+                            PipelineStepProgress("generate", "Gemini DMN Synthesis", "POST /v1beta/models/${settings.geminiModel}:generateContent", StepStatus.PENDING),
+                            PipelineStepProgress("save_vault", "Save Daily Note & Archive .md", "Write 98_Transcript_Archive (.md) & 01_Daily_Notes", StepStatus.PENDING)
+                        ),
+                        startedAtMs = nowMs
+                    )
 
                     val rawText = vaultRepo.readTextByUri(textFile.uri)
                     require(rawText.isNotBlank()) { "${textFile.name} is empty." }
+                    applyVaultStep(
+                        stepId = "read_input",
+                        apiCall = "SAF DocumentFile Read (${textFile.name})",
+                        statusText = "Loaded ${rawText.length} characters",
+                        status = StepStatus.COMPLETED
+                    )
 
                     val timeStr = SimpleDateFormat("hh:mm a", Locale.US).format(Date())
                     val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
@@ -449,7 +562,17 @@ class DmnPipelineOrchestrator(
                         },
                         onStatusDetail = { detail ->
                             _liveStatusMessage.value = "${textFile.name}: $detail"
+                        },
+                        onStepUpdate = { update ->
+                            applyGeminiStepUpdate(update)
                         }
+                    )
+
+                    applyVaultStep(
+                        stepId = "save_vault",
+                        apiCall = "SAF DocumentFile Write (Local ObsidianVault)",
+                        statusText = "Archiving .md transcript & updating Daily Note...",
+                        status = StepStatus.IN_PROGRESS
                     )
 
                     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -473,6 +596,13 @@ class DmnPipelineOrchestrator(
                         archivedAudioName = null,
                         archivedTranscriptName = archivedTranscriptName
                     ).getOrThrow()
+
+                    applyVaultStep(
+                        stepId = "save_vault",
+                        apiCall = "Saved $dailyPath + $archivedTranscriptName",
+                        statusText = "Completed ($archivedTranscriptName & $dailyPath)",
+                        status = StepStatus.COMPLETED
+                    )
 
                     val linksCsv = generation.extractedWikiLinks.joinToString(", ")
                     updateJob(
@@ -526,14 +656,30 @@ class DmnPipelineOrchestrator(
             }
 
             refreshVaultAndInbox()
-            if (processedCount > 0 && settings.autoDriveSync && settings.isDriveConfigured) {
-                scope.launch { runDriveSync() }
+            shouldAutoSync = processedCount > 0 && settings.autoDriveSync && settings.isDriveConfigured
+            if (processedCount > 0) {
+                _completionMessages.tryEmit("Synthesized $processedCount DMN session(s) into Daily Notes & Archives.")
+            } else if (audioTargets.isEmpty() && textTargets.isEmpty()) {
+                _completionMessages.tryEmit("No audio or text items waiting in inbox.")
+            } else {
+                _completionMessages.tryEmit("DMN processing finished with errors. Check Activity & Sync Log.")
             }
             Result.success(processedCount)
-        } finally {
-            _isProcessing.value = false
-            _liveStatusMessage.value = null
+            } finally {
+                _isProcessing.value = false
+                _liveStatusMessage.value = null
+                _activeProcessingProgress.value = null
+            }
         }
+
+        if (shouldAutoSync) {
+            if (awaitAutoSync) {
+                runDriveSync()
+            } else {
+                enqueueOneTimeDriveSync(wifiOnly = settings.syncWifiOnly)
+            }
+        }
+        return queueResult
     }
 
     suspend fun runDriveSync(explicitAccessToken: String? = null): Result<DriveSyncSummary> = syncMutex.withLock {
@@ -547,36 +693,87 @@ class DmnPipelineOrchestrator(
         return@withLock try {
             val token = explicitAccessToken
                 ?: driveAuthManager.fetchFreshAccessTokenSilently().getOrThrow()
-            val result = driveSyncService.runTwoWaySync(
+            val result = driveSyncService.syncVault(
                 accessToken = token,
                 vaultTreeUri = treeUri,
                 driveRootFolderId = folderId,
+                syncDirection = settings.syncDirection,
                 conflictStrategy = settings.conflictStrategy,
                 onStatus = { status -> _liveStatusMessage.value = status }
             )
-            if (result.isSuccess) {
+            result.onSuccess { sum ->
                 settingsRepo.setLastDriveSyncMs(System.currentTimeMillis())
                 refreshVaultAndInbox()
+                _completionMessages.tryEmit(
+                    "${sum.syncMode}: ${sum.uploadedCount} uploaded, ${sum.downloadedCount} downloaded, ${sum.skippedUnchanged} unchanged"
+                )
+            }.onFailure { err ->
+                _completionMessages.tryEmit(err.message ?: "Google Drive sync failed.")
             }
             result
         } catch (e: Exception) {
+            val msg = e.message ?: "Drive sync failed"
             logDao.insertLog(
                 SyncLogEntity(
                     category = "DRIVE",
                     level = "ERROR",
-                    message = e.message ?: "Drive sync failed",
+                    message = msg,
                     details = buildString {
                         appendLine("Drive Root Folder ID: $folderId")
+                        appendLine("Sync Direction: ${settings.syncDirection.name}")
                         appendLine("Exception: ${e.javaClass.name}")
                         append(e.stackTraceToString().take(2000))
                     }.trim()
                 )
             )
+            _completionMessages.tryEmit(msg)
             Result.failure(e)
         } finally {
             _isSyncingDrive.value = false
             _liveStatusMessage.value = null
         }
+    }
+
+    private fun applyGeminiStepUpdate(update: GeminiStepUpdate) {
+        val current = _activeProcessingProgress.value ?: return
+        val newStepStatus = runCatching { StepStatus.valueOf(update.stepStatus) }.getOrDefault(StepStatus.IN_PROGRESS)
+        val updatedSteps = current.steps.map { step ->
+            if (step.id == update.stepId) {
+                step.copy(detail = update.statusText, status = newStepStatus)
+            } else {
+                step
+            }
+        }
+        _activeProcessingProgress.value = current.copy(
+            currentApiCall = update.apiCall,
+            currentStatusText = update.statusText,
+            isRetrying = newStepStatus == StepStatus.RETRYING,
+            attemptNumber = update.attemptNumber,
+            lastHttpStatusOrError = update.errorDetail ?: if (newStepStatus == StepStatus.COMPLETED) null else current.lastHttpStatusOrError,
+            steps = updatedSteps
+        )
+    }
+
+    private fun applyVaultStep(
+        stepId: String,
+        apiCall: String,
+        statusText: String,
+        status: StepStatus
+    ) {
+        val current = _activeProcessingProgress.value ?: return
+        val updatedSteps = current.steps.map { step ->
+            if (step.id == stepId) {
+                step.copy(detail = statusText, status = status)
+            } else {
+                step
+            }
+        }
+        _activeProcessingProgress.value = current.copy(
+            currentApiCall = apiCall,
+            currentStatusText = statusText,
+            isRetrying = false,
+            steps = updatedSteps
+        )
     }
 
     private suspend fun updateJob(

@@ -1,8 +1,14 @@
 package com.example
 
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.drive.DriveSyncManifest
 import com.example.data.drive.GoogleDriveAuthManager
+import com.example.data.drive.GoogleDriveSyncService
+import com.example.data.drive.ManifestFileEntry
 import com.example.data.gemini.GeminiDmnService
+import com.example.data.local.SyncRecordEntity
+import com.example.data.prefs.SyncDirection
+import com.example.data.prefs.VaultSettings
 import com.example.data.vault.GraphEdge
 import com.example.data.vault.GraphNode
 import com.example.data.vault.NodeGroup
@@ -226,5 +232,89 @@ class ForceGraphAndPromptTest {
 
         val diagnostics = GoogleDriveAuthManager.readSigningDiagnostics(ctx)
         assertEquals(ctx.packageName, diagnostics.packageName)
+    }
+
+    @Test
+    fun `drive sync manifest round-trips and detects local and remote deltas accurately`() {
+        assertEquals(SyncDirection.PHONE_TO_DRIVE, VaultSettings().syncDirection)
+
+        val manifest = DriveSyncManifest(
+            version = 1,
+            updatedAtMs = 1_750_000_000_000L,
+            driveStartPageToken = "page-token-42",
+            folders = mutableMapOf("01_Daily_Notes" to "folder_id_1"),
+            files = mutableMapOf(
+                "01_Daily_Notes/2026-11-18.md" to ManifestFileEntry(
+                    id = "drive_file_1",
+                    mimeType = "text/markdown",
+                    localModifiedMs = 1_750_000_000_000L,
+                    remoteModifiedMs = 1_750_000_005_000L,
+                    sizeBytes = 512L,
+                    md5Checksum = "abc123"
+                )
+            )
+        )
+
+        val serialized = GoogleDriveSyncService.serializeManifestJson(manifest)
+        val parsed = GoogleDriveSyncService.parseManifestJson(serialized)
+        assertNotNull(parsed)
+        assertEquals("page-token-42", parsed!!.driveStartPageToken)
+        assertEquals("folder_id_1", parsed.folders["01_Daily_Notes"])
+        val parsedEntry = parsed.files["01_Daily_Notes/2026-11-18.md"]!!
+        assertEquals("drive_file_1", parsedEntry.id)
+        assertEquals(512L, parsedEntry.sizeBytes)
+        assertEquals("abc123", parsedEntry.md5Checksum)
+
+        // Unchanged local file (within 2.5s window and identical size)
+        assertFalse(
+            GoogleDriveSyncService.hasLocalChangedAgainstManifest(
+                localSizeBytes = 512L,
+                localModifiedMs = 1_750_000_001_000L,
+                manifestEntry = parsedEntry,
+                prevRecord = null
+            )
+        )
+        // Changed size triggers upload
+        assertTrue(
+            GoogleDriveSyncService.hasLocalChangedAgainstManifest(
+                localSizeBytes = 640L,
+                localModifiedMs = 1_750_000_000_000L,
+                manifestEntry = parsedEntry,
+                prevRecord = null
+            )
+        )
+        // Changed timestamp (>2500ms) triggers upload
+        assertTrue(
+            GoogleDriveSyncService.hasLocalChangedAgainstManifest(
+                localSizeBytes = 512L,
+                localModifiedMs = 1_750_000_010_000L,
+                manifestEntry = parsedEntry,
+                prevRecord = null
+            )
+        )
+
+        val matchingRecord = SyncRecordEntity(
+            relativePath = "01_Daily_Notes/2026-11-18.md",
+            driveFileId = "drive_file_1",
+            mimeType = "text/markdown",
+            localModifiedMs = 1_750_000_000_000L,
+            localSizeBytes = 512L,
+            remoteModifiedMs = 1_750_000_005_000L,
+            remoteMd5 = "abc123",
+            syncState = "SYNCED"
+        )
+        assertFalse(GoogleDriveSyncService.hasRemoteChangedAgainstBaseline(parsedEntry, matchingRecord))
+        assertTrue(
+            GoogleDriveSyncService.hasRemoteChangedAgainstBaseline(
+                parsedEntry.copy(md5Checksum = "def456"),
+                matchingRecord
+            )
+        )
+        assertTrue(
+            GoogleDriveSyncService.hasRemoteChangedAgainstBaseline(
+                parsedEntry.copy(remoteModifiedMs = 1_750_000_020_000L),
+                matchingRecord
+            )
+        )
     }
 }

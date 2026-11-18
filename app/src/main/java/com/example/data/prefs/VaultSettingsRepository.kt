@@ -20,6 +20,11 @@ enum class ConflictStrategy(val label: String) {
     KEEP_BOTH("Keep Conflict Copy")
 }
 
+enum class SyncDirection(val label: String) {
+    PHONE_TO_DRIVE("Phone → Drive"),
+    TWO_WAY("Two-Way Sync")
+}
+
 data class VaultSettings(
     val vaultTreeUri: String? = null,
     val vaultDisplayName: String = "",
@@ -31,6 +36,7 @@ data class VaultSettings(
     val driveFolderName: String = "ObsidianVault",
     val autoDriveSync: Boolean = true,
     val syncWifiOnly: Boolean = false,
+    val syncDirection: SyncDirection = SyncDirection.PHONE_TO_DRIVE,
     val conflictStrategy: ConflictStrategy = ConflictStrategy.KEEP_NEWER,
     val lastDriveSyncMs: Long = 0L,
     val darkTheme: Boolean = true,
@@ -59,6 +65,7 @@ class VaultSettingsRepository(private val context: Context) {
         val DRIVE_FOLDER_NAME = stringPreferencesKey("drive_folder_name")
         val AUTO_DRIVE_SYNC = booleanPreferencesKey("auto_drive_sync")
         val SYNC_WIFI_ONLY = booleanPreferencesKey("sync_wifi_only")
+        val SYNC_DIRECTION = stringPreferencesKey("sync_direction")
         val CONFLICT_STRATEGY = stringPreferencesKey("conflict_strategy")
         val LAST_DRIVE_SYNC_MS = longPreferencesKey("last_drive_sync_ms")
         val DARK_THEME = booleanPreferencesKey("dark_theme")
@@ -69,6 +76,9 @@ class VaultSettingsRepository(private val context: Context) {
         val strategyName = prefs[Keys.CONFLICT_STRATEGY] ?: ConflictStrategy.KEEP_NEWER.name
         val strategy = runCatching { ConflictStrategy.valueOf(strategyName) }
             .getOrDefault(ConflictStrategy.KEEP_NEWER)
+        val directionName = prefs[Keys.SYNC_DIRECTION] ?: SyncDirection.PHONE_TO_DRIVE.name
+        val direction = runCatching { SyncDirection.valueOf(directionName) }
+            .getOrDefault(SyncDirection.PHONE_TO_DRIVE)
         VaultSettings(
             vaultTreeUri = prefs[Keys.VAULT_TREE_URI],
             vaultDisplayName = prefs[Keys.VAULT_DISPLAY_NAME] ?: "",
@@ -81,6 +91,7 @@ class VaultSettingsRepository(private val context: Context) {
             driveFolderName = prefs[Keys.DRIVE_FOLDER_NAME] ?: "ObsidianVault",
             autoDriveSync = prefs[Keys.AUTO_DRIVE_SYNC] ?: true,
             syncWifiOnly = prefs[Keys.SYNC_WIFI_ONLY] ?: false,
+            syncDirection = direction,
             conflictStrategy = strategy,
             lastDriveSyncMs = prefs[Keys.LAST_DRIVE_SYNC_MS] ?: 0L,
             darkTheme = prefs[Keys.DARK_THEME] ?: true,
@@ -132,11 +143,13 @@ class VaultSettingsRepository(private val context: Context) {
     suspend fun setSyncOptions(
         autoSync: Boolean,
         wifiOnly: Boolean,
+        syncDirection: SyncDirection,
         conflictStrategy: ConflictStrategy
     ) {
         context.vaultDataStore.edit {
             it[Keys.AUTO_DRIVE_SYNC] = autoSync
             it[Keys.SYNC_WIFI_ONLY] = wifiOnly
+            it[Keys.SYNC_DIRECTION] = syncDirection.name
             it[Keys.CONFLICT_STRATEGY] = conflictStrategy.name
         }
     }

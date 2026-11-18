@@ -1,10 +1,15 @@
 package com.example.ui.screens
 
+import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -19,12 +24,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -78,10 +83,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.example.data.drive.DriveFolderItem
 import com.example.data.drive.GoogleDriveAuthManager
 import com.example.data.local.SyncLogEntity
 import com.example.data.prefs.ConflictStrategy
+import com.example.data.prefs.SyncDirection
 import com.example.data.prefs.VaultSettings
 import com.example.data.vault.ObsidianVaultRepository
 import com.example.ui.components.StatusPill
@@ -106,7 +113,7 @@ fun SyncScreen(
     onCreateDriveFolder: (String) -> Unit,
     onDisconnectDrive: () -> Unit,
     onSyncDriveNow: () -> Unit,
-    onUpdateAutomation: (autoProcess: Boolean, autoSync: Boolean, wifiOnly: Boolean, strategy: ConflictStrategy) -> Unit,
+    onUpdateAutomation: (autoProcess: Boolean, autoSync: Boolean, wifiOnly: Boolean, syncDirection: SyncDirection, strategy: ConflictStrategy) -> Unit,
     onUpdateAudioRetentionDays: (Int) -> Unit,
     onPruneExpiredAudioNow: () -> Unit,
     onToggleDarkTheme: (Boolean) -> Unit,
@@ -135,6 +142,22 @@ fun SyncScreen(
     }
     var showOAuthGuide by remember { mutableStateOf(false) }
 
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        onSyncDriveNow()
+    }
+
+    fun launchDriveSyncWithNotificationConsent() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            onSyncDriveNow()
+        }
+    }
+
     LaunchedEffect(state.driveAuthError) {
         if (!state.driveAuthError.isNullOrBlank()) {
             showOAuthGuide = true
@@ -159,7 +182,7 @@ fun SyncScreen(
                 color = MaterialTheme.colorScheme.onBackground
             )
             Text(
-                text = "Configure ObsidianVault storage, Google AI Studio API, and two-way Google Drive sync",
+                text = "Configure ObsidianVault storage, Google AI Studio API, and metadata-delta Google Drive sync",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -540,7 +563,7 @@ fun SyncScreen(
                         }
 
                         Button(
-                            onClick = onSyncDriveNow,
+                            onClick = { launchDriveSyncWithNotificationConsent() },
                             enabled = !state.isSyncingDrive && state.settings.isVaultConfigured && state.settings.isDriveConfigured,
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -548,7 +571,7 @@ fun SyncScreen(
                         ) {
                             Icon(Icons.Outlined.CloudDone, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Run Two-Way Drive Sync Now")
+                            Text("Run ${state.settings.syncDirection.label} Now")
                         }
                     }
 
@@ -663,13 +686,14 @@ fun SyncScreen(
                                 it,
                                 state.settings.autoDriveSync,
                                 state.settings.syncWifiOnly,
+                                state.settings.syncDirection,
                                 state.settings.conflictStrategy
                             )
                         }
                     )
 
                     ToggleRow(
-                        title = "Auto Two-Way Drive Sync",
+                        title = "Auto Background Drive Sync",
                         subtitle = "Sync after DMN synthesis and every 2 hours in background",
                         checked = state.settings.autoDriveSync,
                         testTag = "auto_drive_sync_switch",
@@ -678,6 +702,7 @@ fun SyncScreen(
                                 state.settings.autoProcessAudio,
                                 it,
                                 state.settings.syncWifiOnly,
+                                state.settings.syncDirection,
                                 state.settings.conflictStrategy
                             )
                         }
@@ -693,6 +718,7 @@ fun SyncScreen(
                                 state.settings.autoProcessAudio,
                                 state.settings.autoDriveSync,
                                 it,
+                                state.settings.syncDirection,
                                 state.settings.conflictStrategy
                             )
                         }
@@ -706,22 +732,54 @@ fun SyncScreen(
                         onCheckedChange = onToggleDarkTheme
                     )
 
-                    Text("Conflict Resolution", style = MaterialTheme.typography.titleSmall)
+                    Text("Sync Direction", style = MaterialTheme.typography.titleSmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        ConflictStrategy.entries.forEach { strategy ->
+                        SyncDirection.entries.forEach { direction ->
                             FilterChip(
-                                selected = state.settings.conflictStrategy == strategy,
+                                selected = state.settings.syncDirection == direction,
                                 onClick = {
                                     onUpdateAutomation(
                                         state.settings.autoProcessAudio,
                                         state.settings.autoDriveSync,
                                         state.settings.syncWifiOnly,
-                                        strategy
+                                        direction,
+                                        state.settings.conflictStrategy
                                     )
                                 },
-                                label = { Text(strategy.label) },
-                                modifier = Modifier.testTag("conflict_${strategy.name.lowercase()}")
+                                label = { Text(direction.label) },
+                                modifier = Modifier.testTag("sync_direction_${direction.name.lowercase()}")
                             )
+                        }
+                    }
+                    Text(
+                        text = if (state.settings.syncDirection == SyncDirection.PHONE_TO_DRIVE) {
+                            "Default fast push: checks .synapse_sync_manifest.json and uploads only new or modified files from your phone."
+                        } else {
+                            "Uses .synapse_sync_manifest.json and Drive Changes API to transfer only changed files in both directions."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    if (state.settings.syncDirection == SyncDirection.TWO_WAY) {
+                        Text("Conflict Resolution", style = MaterialTheme.typography.titleSmall)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ConflictStrategy.entries.forEach { strategy ->
+                                FilterChip(
+                                    selected = state.settings.conflictStrategy == strategy,
+                                    onClick = {
+                                        onUpdateAutomation(
+                                            state.settings.autoProcessAudio,
+                                            state.settings.autoDriveSync,
+                                            state.settings.syncWifiOnly,
+                                            state.settings.syncDirection,
+                                            strategy
+                                        )
+                                    },
+                                    label = { Text(strategy.label) },
+                                    modifier = Modifier.testTag("conflict_${strategy.name.lowercase()}")
+                                )
+                            }
                         }
                     }
                 }

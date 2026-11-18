@@ -14,7 +14,9 @@ import com.example.data.drive.DriveAuthOutcome
 import com.example.data.drive.DriveFolderItem
 import com.example.data.local.ProcessingJobEntity
 import com.example.data.local.SyncLogEntity
+import com.example.data.pipeline.ActiveProcessingProgress
 import com.example.data.prefs.ConflictStrategy
+import com.example.data.prefs.SyncDirection
 import com.example.data.prefs.VaultSettings
 import com.example.data.vault.ArchivedAudioItem
 import com.example.data.vault.ArchivedTranscript
@@ -55,6 +57,7 @@ data class MainUiState(
     val isProcessingAudio: Boolean = false,
     val isSyncingDrive: Boolean = false,
     val liveStatusMessage: String? = null,
+    val activeProcessingProgress: ActiveProcessingProgress? = null,
     val geminiTestState: GeminiTestState = GeminiTestState.Idle,
     val driveFolders: List<DriveFolderItem> = emptyList(),
     val isLoadingDriveFolders: Boolean = false,
@@ -141,7 +144,8 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         val graph: KnowledgeGraphData,
         val isProc: Boolean,
         val isSync: Boolean,
-        val liveMsg: String?
+        val liveMsg: String?,
+        val activeProgress: ActiveProcessingProgress?
     )
 
     private val inboxArchiveFlow = combine(
@@ -162,9 +166,10 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         combine(
             app.pipelineOrchestrator.isProcessing,
             app.pipelineOrchestrator.isSyncingDrive,
-            app.pipelineOrchestrator.liveStatusMessage
-        ) { p, s, m -> Triple(p, s, m) }
-    ) { vaultItems, jobs, logs, graph, statusTriple ->
+            app.pipelineOrchestrator.liveStatusMessage,
+            app.pipelineOrchestrator.activeProcessingProgress
+        ) { p, s, m, prog -> listOf(p, s, m, prog) }
+    ) { vaultItems, jobs, logs, graph, statusList ->
         PipelineFlowState(
             inbox = vaultItems[0] as List<InboxAudioFile>,
             inboxText = vaultItems[1] as List<InboxTextFile>,
@@ -173,9 +178,10 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             jobs = jobs,
             logs = logs,
             graph = graph,
-            isProc = statusTriple.first,
-            isSync = statusTriple.second,
-            liveMsg = statusTriple.third
+            isProc = statusList[0] as Boolean,
+            isSync = statusList[1] as Boolean,
+            liveMsg = statusList[2] as String?,
+            activeProgress = statusList[3] as ActiveProcessingProgress?
         )
     }
 
@@ -211,6 +217,7 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             isProcessingAudio = pipe.isProc,
             isSyncingDrive = pipe.isSync,
             liveStatusMessage = pipe.liveMsg,
+            activeProcessingProgress = pipe.activeProgress,
             geminiTestState = aux.geminiTest,
             driveFolders = aux.driveFolders,
             isLoadingDriveFolders = aux.loadingFolders,
@@ -228,6 +235,11 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
 
     init {
         refreshAll()
+        viewModelScope.launch {
+            app.pipelineOrchestrator.completionMessages.collect { msg ->
+                _snackbarMessages.emit(msg)
+            }
+        }
     }
 
     fun refreshAll() {
@@ -384,14 +396,11 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
                     if (!settings.isGeminiConfigured) {
                         _snackbarMessages.emit("Saved ${textItem.name} to 04_Text_Inbox. Add your Gemini API key in Sync to synthesize.")
                     } else {
-                        val res = app.pipelineOrchestrator.processInboxQueue(singleTargetUri = textItem.uri.toString())
-                        res.onSuccess { count ->
-                            if (count > 0) {
-                                _snackbarMessages.emit("DMN entry synthesized & original archived to 98_Transcript_Archive.")
-                            }
-                        }.onFailure { err ->
-                            _snackbarMessages.emit(err.message ?: "Synthesis failed.")
-                        }
+                        app.pipelineOrchestrator.enqueueBackgroundProcessing(
+                            triggerImmediateIfOnline = true,
+                            singleTargetUri = textItem.uri.toString()
+                        )
+                        _snackbarMessages.emit("Synthesizing ${textItem.name} in background (safe to minimize app).")
                     }
                 } else {
                     _snackbarMessages.emit("Saved ${textItem.name} to 04_Text_Inbox.")
@@ -469,27 +478,36 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
 
     fun processAllInboxNow() {
         viewModelScope.launch {
-            val res = app.pipelineOrchestrator.processInboxQueue()
-            res.onSuccess { count ->
-                if (count == 0) {
-                    _snackbarMessages.emit("No audio or text items waiting in inbox.")
-                } else {
-                    _snackbarMessages.emit("Synthesized $count DMN session(s) into Daily Notes & Archives.")
-                }
-            }.onFailure { err ->
-                _snackbarMessages.emit(err.message ?: "Processing failed.")
+            val settings = app.settingsRepo.currentSettings()
+            if (!settings.isVaultConfigured) {
+                _snackbarMessages.emit("Select your ObsidianVault folder first.")
+                return@launch
             }
+            if (!settings.isGeminiConfigured) {
+                _snackbarMessages.emit("Enter your Google AI Studio API key first.")
+                return@launch
+            }
+            app.pipelineOrchestrator.enqueueBackgroundProcessing(triggerImmediateIfOnline = true)
+            _snackbarMessages.emit("Processing inbox in background (safe to minimize app).")
         }
     }
 
     fun processSingleInboxItemNow(itemUri: String) {
         viewModelScope.launch {
-            val res = app.pipelineOrchestrator.processInboxQueue(singleTargetUri = itemUri)
-            res.onSuccess { count ->
-                if (count > 0) _snackbarMessages.emit("DMN session written to 01_Daily_Notes & archived.")
-            }.onFailure { err ->
-                _snackbarMessages.emit(err.message ?: "Processing failed.")
+            val settings = app.settingsRepo.currentSettings()
+            if (!settings.isVaultConfigured) {
+                _snackbarMessages.emit("Select your ObsidianVault folder first.")
+                return@launch
             }
+            if (!settings.isGeminiConfigured) {
+                _snackbarMessages.emit("Enter your Google AI Studio API key first.")
+                return@launch
+            }
+            app.pipelineOrchestrator.enqueueBackgroundProcessing(
+                triggerImmediateIfOnline = true,
+                singleTargetUri = itemUri
+            )
+            _snackbarMessages.emit("Synthesizing item in background (safe to minimize app).")
         }
     }
 
@@ -699,14 +717,17 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
 
     fun syncDriveNow() {
         viewModelScope.launch {
-            val res = app.pipelineOrchestrator.runDriveSync()
-            res.onSuccess { sum ->
-                _snackbarMessages.emit(
-                    "Drive Sync: ↑${sum.uploadedCount} uploaded, ↓${sum.downloadedCount} downloaded, ${sum.conflictsResolved} conflicts"
-                )
-            }.onFailure { err ->
-                _snackbarMessages.emit(err.message ?: "Google Drive sync failed.")
+            val settings = app.settingsRepo.currentSettings()
+            if (!settings.isVaultConfigured) {
+                _snackbarMessages.emit("Select your ObsidianVault folder first.")
+                return@launch
             }
+            if (!settings.isDriveConfigured) {
+                _snackbarMessages.emit("Choose a Google Drive folder in Sync first.")
+                return@launch
+            }
+            app.pipelineOrchestrator.enqueueOneTimeDriveSync(wifiOnly = false)
+            _snackbarMessages.emit("Running ${settings.syncDirection.label} in background (safe to minimize app).")
         }
     }
 
@@ -714,11 +735,12 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         autoProcess: Boolean,
         autoDriveSync: Boolean,
         wifiOnly: Boolean,
+        syncDirection: SyncDirection,
         conflictStrategy: ConflictStrategy
     ) {
         viewModelScope.launch {
             app.settingsRepo.setAutoProcessAudio(autoProcess)
-            app.settingsRepo.setSyncOptions(autoDriveSync, wifiOnly, conflictStrategy)
+            app.settingsRepo.setSyncOptions(autoDriveSync, wifiOnly, syncDirection, conflictStrategy)
             app.pipelineOrchestrator.schedulePeriodicDriveSync(autoDriveSync, wifiOnly)
         }
     }

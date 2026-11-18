@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,15 +28,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Pause
@@ -50,7 +55,9 @@ import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.Loop
 import androidx.compose.material.icons.outlined.Mic
+import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material3.AlertDialog
@@ -58,6 +65,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -70,7 +78,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -86,7 +97,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -94,6 +107,8 @@ import androidx.core.content.ContextCompat
 import com.example.audio.RecordingState
 import com.example.data.local.JobStatus
 import com.example.data.local.ProcessingJobEntity
+import com.example.data.pipeline.ActiveProcessingProgress
+import com.example.data.pipeline.StepStatus
 import com.example.data.vault.InboxAudioFile
 import com.example.data.vault.InboxTextFile
 import com.example.ui.components.SetupChecklistCard
@@ -103,6 +118,7 @@ import com.example.ui.components.formatDurationMs
 import com.example.ui.components.formatRelativeTimestamp
 import com.example.ui.theme.LocalSynapseColors
 import com.example.ui.viewmodel.MainUiState
+import kotlinx.coroutines.delay
 
 private enum class StudioCaptureMode { VOICE, TEXT }
 
@@ -128,7 +144,18 @@ fun StudioScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     val sem = LocalSynapseColors.current
+
+    // Keep display awake while on the Studio / Recording screen
+    DisposableEffect(view) {
+        val previousKeepScreenOn = view.keepScreenOn
+        view.keepScreenOn = true
+        onDispose {
+            view.keepScreenOn = previousKeepScreenOn
+        }
+    }
+
     var captureMode by rememberSaveable { mutableStateOf(StudioCaptureMode.VOICE) }
     var sessionLabel by remember { mutableStateOf("DMN") }
     var textTitle by rememberSaveable { mutableStateOf("") }
@@ -136,6 +163,8 @@ fun StudioScreen(
     var textExtension by rememberSaveable { mutableStateOf("md") }
     var permissionDeniedNotice by remember { mutableStateOf(false) }
     var jobPendingDelete by remember { mutableStateOf<ProcessingJobEntity?>(null) }
+    var showProgressDialog by remember { mutableStateOf(false) }
+    var pendingNotificationAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -145,6 +174,24 @@ fun StudioScreen(
             onStartRecording(sessionLabel)
         } else {
             permissionDeniedNotice = true
+        }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        pendingNotificationAction?.invoke()
+        pendingNotificationAction = null
+    }
+
+    fun runWithBackgroundNotificationConsent(action: () -> Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingNotificationAction = action
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            action()
         }
     }
 
@@ -273,9 +320,14 @@ fun StudioScreen(
                         textBody = ""
                     },
                     onSynthesizeNow = {
-                        onSubmitTextNote(textBody, textTitle, textExtension, true)
+                        val capturedBody = textBody
+                        val capturedTitle = textTitle
+                        val capturedExt = textExtension
                         textTitle = ""
                         textBody = ""
+                        runWithBackgroundNotificationConsent {
+                            onSubmitTextNote(capturedBody, capturedTitle, capturedExt, true)
+                        }
                     }
                 )
             }
@@ -283,11 +335,20 @@ fun StudioScreen(
 
         item {
             AnimatedVisibility(visible = state.isProcessingAudio || state.liveStatusMessage != null) {
+                val activeProgress = state.activeProcessingProgress
                 Card(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(MaterialTheme.shapes.medium)
+                        .clickable { showProgressDialog = true }
+                        .testTag("live_processing_banner"),
                     shape = MaterialTheme.shapes.medium,
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        if (activeProgress?.isRetrying == true) sem.amber else MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)
                     )
                 ) {
                     Column(
@@ -295,20 +356,49 @@ fun StudioScreen(
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Row(
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Icon(
-                                imageVector = Icons.Outlined.AutoAwesome,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Text(
-                                text = state.liveStatusMessage ?: "Processing DMN queue...",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            )
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (activeProgress?.isRetrying == true) Icons.Outlined.Loop else Icons.Outlined.AutoAwesome,
+                                    contentDescription = null,
+                                    tint = if (activeProgress?.isRetrying == true) sem.amber else MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(
+                                    text = state.liveStatusMessage ?: "Processing DMN queue...",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = if (activeProgress?.isRetrying == true) {
+                                        "Retry #${activeProgress.attemptNumber}"
+                                    } else {
+                                        "Details"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (activeProgress?.isRetrying == true) sem.amber else MaterialTheme.colorScheme.primary
+                                )
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                                    contentDescription = "Inspect processing step details",
+                                    tint = if (activeProgress?.isRetrying == true) sem.amber else MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                         }
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     }
@@ -336,7 +426,7 @@ fun StudioScreen(
                     )
                 }
                 Button(
-                    onClick = onProcessAllNow,
+                    onClick = { runWithBackgroundNotificationConsent(onProcessAllNow) },
                     enabled = totalPending > 0 && !state.isProcessingAudio &&
                         state.settings.isVaultConfigured && state.settings.isGeminiConfigured,
                     modifier = Modifier.testTag("process_all_button")
@@ -387,7 +477,11 @@ fun StudioScreen(
                 InboxAudioCard(
                     audio = audio,
                     canProcess = !state.isProcessingAudio && state.settings.isGeminiConfigured,
-                    onProcess = { onProcessSingle(audio.uri.toString()) },
+                    onProcess = {
+                        runWithBackgroundNotificationConsent {
+                            onProcessSingle(audio.uri.toString())
+                        }
+                    },
                     onDelete = { onDeleteInboxAudio(audio) }
                 )
             }
@@ -395,7 +489,11 @@ fun StudioScreen(
                 InboxTextCard(
                     textFile = textFile,
                     canProcess = !state.isProcessingAudio && state.settings.isGeminiConfigured,
-                    onProcess = { onProcessSingle(textFile.uri.toString()) },
+                    onProcess = {
+                        runWithBackgroundNotificationConsent {
+                            onProcessSingle(textFile.uri.toString())
+                        }
+                    },
                     onDelete = { onDeleteInboxText(textFile) }
                 )
             }
@@ -428,12 +526,22 @@ fun StudioScreen(
                 ProcessingJobCard(
                     job = job,
                     onOpenNote = onOpenNote,
+                    onInspectActive = { showProgressDialog = true },
                     onRequestDelete = { jobPendingDelete = job }
                 )
             }
         }
 
         item { Spacer(modifier = Modifier.height(16.dp)) }
+    }
+
+    if (showProgressDialog) {
+        ActiveProcessingDialog(
+            progress = state.activeProcessingProgress,
+            fallbackStatusMessage = state.liveStatusMessage,
+            isProcessing = state.isProcessingAudio || state.isSyncingDrive,
+            onDismiss = { showProgressDialog = false }
+        )
     }
 
     jobPendingDelete?.let { targetJob ->
@@ -514,23 +622,31 @@ private fun VoiceRecorderHeroCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                StatusPill(
-                    label = when (recordingState) {
-                        RecordingState.IDLE -> "Unbounded • Offline Ready"
-                        RecordingState.RECORDING -> "Recording Live"
-                        RecordingState.PAUSED -> "Paused"
-                    },
-                    color = when (recordingState) {
-                        RecordingState.IDLE -> sem.amber
-                        RecordingState.RECORDING -> sem.recordingCrimson
-                        RecordingState.PAUSED -> sem.amber
-                    },
-                    containerColor = when (recordingState) {
-                        RecordingState.IDLE -> sem.amberContainer
-                        RecordingState.RECORDING -> sem.recordingCrimsonContainer
-                        RecordingState.PAUSED -> sem.amberContainer
-                    }
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    StatusPill(
+                        label = when (recordingState) {
+                            RecordingState.IDLE -> "Unbounded • Offline Ready"
+                            RecordingState.RECORDING -> "Recording Live"
+                            RecordingState.PAUSED -> "Paused"
+                        },
+                        color = when (recordingState) {
+                            RecordingState.IDLE -> sem.amber
+                            RecordingState.RECORDING -> sem.recordingCrimson
+                            RecordingState.PAUSED -> sem.amber
+                        },
+                        containerColor = when (recordingState) {
+                            RecordingState.IDLE -> sem.amberContainer
+                            RecordingState.RECORDING -> sem.recordingCrimsonContainer
+                            RecordingState.PAUSED -> sem.amberContainer
+                        }
+                    )
+                    Text(
+                        text = "Screen Always On",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.testTag("screen_awake_label")
+                    )
+                }
                 Text(
                     text = formatDurationMs(elapsedMs),
                     style = MaterialTheme.typography.headlineMedium,
@@ -1038,10 +1154,14 @@ private fun InboxTextCard(
 private fun ProcessingJobCard(
     job: ProcessingJobEntity,
     onOpenNote: (String) -> Unit,
+    onInspectActive: () -> Unit,
     onRequestDelete: () -> Unit
 ) {
     val sem = LocalSynapseColors.current
     val status = runCatching { JobStatus.valueOf(job.status) }.getOrDefault(JobStatus.QUEUED)
+    val isActiveJob = status == JobStatus.UPLOADING ||
+        status == JobStatus.PROCESSING_REMOTE ||
+        status == JobStatus.SYNTHESIZING
     val (color, bg, icon) = when (status) {
         JobStatus.COMPLETED -> Triple(sem.emerald, sem.emeraldContainer, Icons.Outlined.CheckCircle)
         JobStatus.FAILED -> Triple(sem.recordingCrimson, sem.recordingCrimsonContainer, Icons.Outlined.ErrorOutline)
@@ -1053,10 +1173,10 @@ private fun ProcessingJobCard(
         modifier = Modifier
             .fillMaxWidth()
             .then(
-                if (job.outputNotePath != null) {
-                    Modifier.clickable { onOpenNote(job.outputNotePath) }
-                } else {
-                    Modifier
+                when {
+                    job.outputNotePath != null -> Modifier.clickable { onOpenNote(job.outputNotePath) }
+                    isActiveJob -> Modifier.clickable { onInspectActive() }
+                    else -> Modifier
                 }
             ),
         shape = MaterialTheme.shapes.medium,
@@ -1161,4 +1281,251 @@ private fun ProcessingJobCard(
             }
         }
     }
+}
+
+@Composable
+private fun ActiveProcessingDialog(
+    progress: ActiveProcessingProgress?,
+    fallbackStatusMessage: String?,
+    isProcessing: Boolean,
+    onDismiss: () -> Unit
+) {
+    val sem = LocalSynapseColors.current
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(progress?.startedAtMs, isProcessing) {
+        if (progress != null || isProcessing) {
+            while (true) {
+                nowMs = System.currentTimeMillis()
+                delay(1000L)
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = if (progress != null) "Current Synthesis Status" else "Background Pipeline Status",
+                    style = MaterialTheme.typography.titleLarge
+                )
+                if (progress != null) {
+                    val elapsedSec = ((nowMs - progress.startedAtMs).coerceAtLeast(0L) / 1000L)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        StatusPill(
+                            label = progress.inputKind,
+                            color = MaterialTheme.colorScheme.primary,
+                            containerColor = MaterialTheme.colorScheme.primaryContainer
+                        )
+                        StatusPill(
+                            label = progress.modelId,
+                            color = sem.insightPurple,
+                            containerColor = sem.insightPurpleContainer
+                        )
+                        Text(
+                            text = "${elapsedSec}s",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                if (progress == null) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = fallbackStatusMessage
+                                    ?: if (isProcessing) "Preparing next item in queue..." else "Processing finished.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            if (isProcessing) {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            }
+                        }
+                    }
+                } else {
+                    Text(
+                        text = progress.fileName,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    // Highlighted Current API Call & Status Card
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(
+                            1.dp,
+                            if (progress.isRetrying) sem.amber else MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "ACTIVE API CALL",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                StatusPill(
+                                    label = if (progress.isRetrying) {
+                                        "RETRYING (#${progress.attemptNumber})"
+                                    } else {
+                                        "IN PROGRESS"
+                                    },
+                                    color = if (progress.isRetrying) sem.amber else sem.dailyBlue,
+                                    containerColor = if (progress.isRetrying) sem.amberContainer else MaterialTheme.colorScheme.primaryContainer
+                                )
+                            }
+                            SelectionContainer {
+                                Text(
+                                    text = progress.currentApiCall,
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            Text(
+                                text = progress.currentStatusText,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            if (!progress.lastHttpStatusOrError.isNullOrBlank()) {
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = MaterialTheme.shapes.extraSmall,
+                                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f)
+                                ) {
+                                    SelectionContainer {
+                                        Text(
+                                            text = progress.lastHttpStatusOrError,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                            color = MaterialTheme.colorScheme.onErrorContainer,
+                                            modifier = Modifier.padding(8.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Text(
+                        text = "Steps for This File",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        progress.steps.forEach { step ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("progress_step_${step.id}"),
+                                verticalAlignment = Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .padding(top = 2.dp)
+                                        .size(18.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    when (step.status) {
+                                        StepStatus.COMPLETED -> Icon(
+                                            imageVector = Icons.Outlined.CheckCircle,
+                                            contentDescription = "Completed",
+                                            tint = sem.emerald,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        StepStatus.IN_PROGRESS -> CircularProgressIndicator(
+                                            modifier = Modifier.size(15.dp),
+                                            strokeWidth = 2.dp,
+                                            color = sem.dailyBlue
+                                        )
+                                        StepStatus.RETRYING -> Icon(
+                                            imageVector = Icons.Outlined.Loop,
+                                            contentDescription = "Retrying",
+                                            tint = sem.amber,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        StepStatus.FAILED -> Icon(
+                                            imageVector = Icons.Outlined.ErrorOutline,
+                                            contentDescription = "Failed",
+                                            tint = sem.recordingCrimson,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        StepStatus.PENDING -> Icon(
+                                            imageVector = Icons.Outlined.RadioButtonUnchecked,
+                                            contentDescription = "Pending",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = step.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (step.status == StepStatus.IN_PROGRESS || step.status == StepStatus.RETRYING) {
+                                            FontWeight.SemiBold
+                                        } else {
+                                            FontWeight.Normal
+                                        },
+                                        color = when (step.status) {
+                                            StepStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            StepStatus.FAILED -> sem.recordingCrimson
+                                            else -> MaterialTheme.colorScheme.onSurface
+                                        }
+                                    )
+                                    if (step.detail.isNotBlank()) {
+                                        Text(
+                                            text = step.detail,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("close_processing_details_button")
+            ) {
+                Text("Close")
+            }
+        }
+    )
 }
