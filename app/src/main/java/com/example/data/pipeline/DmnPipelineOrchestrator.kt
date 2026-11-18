@@ -16,6 +16,7 @@ import com.example.data.drive.GoogleDriveSyncService
 import com.example.data.gemini.GeminiApiException
 import com.example.data.gemini.GeminiDmnService
 import com.example.data.gemini.GeminiStepUpdate
+import com.example.data.gemini.RetryControlChannel
 import com.example.data.local.JobStatus
 import com.example.data.local.ProcessingJobDao
 import com.example.data.local.ProcessingJobEntity
@@ -47,6 +48,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 enum class StepStatus {
     PENDING,
@@ -72,6 +74,10 @@ data class ActiveProcessingProgress(
     val isRetrying: Boolean = false,
     val attemptNumber: Int = 1,
     val lastHttpStatusOrError: String? = null,
+    val requestPayloadSummary: String? = null,
+    val lastResponsePayload: String? = null,
+    val pendingOverrideModel: String? = null,
+    val attemptHistory: List<String> = emptyList(),
     val steps: List<PipelineStepProgress> = emptyList(),
     val startedAtMs: Long = System.currentTimeMillis()
 )
@@ -120,6 +126,37 @@ class DmnPipelineOrchestrator(
 
     private val _completionMessages = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val completionMessages: SharedFlow<String> = _completionMessages.asSharedFlow()
+
+    private val retryControlRef = AtomicReference<RetryControlChannel?>(null)
+    @Volatile
+    private var batchOverrideModel: String? = null
+
+    fun switchModelForActiveRetry(newModelId: String, retryImmediately: Boolean = true) {
+        val clean = newModelId.trim()
+        if (clean.isBlank()) return
+        batchOverrideModel = clean
+        retryControlRef.get()?.requestModelSwitch(clean, interruptActiveCall = retryImmediately)
+        val timeTag = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        val current = _activeProcessingProgress.value ?: return
+        val note = if (retryImmediately) {
+            "[$timeTag] Switched model to $clean (retrying immediately)"
+        } else {
+            "[$timeTag] Queued model $clean for next retry"
+        }
+        _activeProcessingProgress.value = current.copy(
+            pendingOverrideModel = clean,
+            attemptHistory = (current.attemptHistory + note).takeLast(25)
+        )
+    }
+
+    fun triggerImmediateRetryNow() {
+        val timeTag = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        retryControlRef.get()?.requestImmediateRetry()
+        val current = _activeProcessingProgress.value ?: return
+        _activeProcessingProgress.value = current.copy(
+            attemptHistory = (current.attemptHistory + "[$timeTag] Manual immediate retry requested").takeLast(25)
+        )
+    }
 
     suspend fun refreshVaultAndInbox() {
         val settings = settingsRepo.currentSettings()
@@ -357,6 +394,9 @@ class DmnPipelineOrchestrator(
             }
 
             _isProcessing.value = true
+            batchOverrideModel = null
+            val retryControl = RetryControlChannel()
+            retryControlRef.set(retryControl)
             try {
             vaultRepo.ensureRequiredFolders(treeUri)
             val allAudio = vaultRepo.listInboxAudioFiles(treeUri)
@@ -381,21 +421,25 @@ class DmnPipelineOrchestrator(
             // 1. Process Audio Inbox Items
             for (audio in audioTargets) {
                 val nowMs = System.currentTimeMillis()
+                val startModel = batchOverrideModel ?: settings.geminiModel
+                val timeTag = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(nowMs))
                 try {
                     updateJob(audio.uri.toString(), audio.name, audio.sizeBytes, JobStatus.UPLOADING, null, null, null, null, nowMs)
                     _liveStatusMessage.value = "Uploading ${audio.name}..."
                     _activeProcessingProgress.value = ActiveProcessingProgress(
                         fileName = audio.name,
                         inputKind = "Voice Audio",
-                        modelId = settings.geminiModel,
+                        modelId = startModel,
                         currentApiCall = "Local SAF Scan (${existingNodes.size} graph nodes indexed)",
                         currentStatusText = "Preparing audio upload to Gemini Files API...",
+                        requestPayloadSummary = "Local File: ${audio.name} (${audio.sizeBytes / 1024} KB, ${audio.mimeType})",
+                        attemptHistory = listOf("[$timeTag] Indexed ${existingNodes.size} graph hub(s); starting pipeline with $startModel"),
                         steps = listOf(
                             PipelineStepProgress("scan_graph", "Index Knowledge Graph", "Loaded ${existingNodes.size} existing [[WikiLink]] hubs", StepStatus.COMPLETED),
                             PipelineStepProgress("upload_start", "Initiate Resumable Upload", "POST /upload/v1beta/files (start)", StepStatus.PENDING),
                             PipelineStepProgress("upload_bytes", "Stream Audio Payload", "Streaming ${audio.sizeBytes / 1024} KB (${audio.mimeType})", StepStatus.PENDING),
                             PipelineStepProgress("file_active", "Index Audio Remotely", "Waiting for Gemini Files state=ACTIVE", StepStatus.PENDING),
-                            PipelineStepProgress("generate", "Gemini DMN Synthesis", "POST /v1beta/models/${settings.geminiModel}:generateContent", StepStatus.PENDING),
+                            PipelineStepProgress("generate", "Gemini DMN Synthesis", "POST /v1beta/models/$startModel:generateContent", StepStatus.PENDING),
                             PipelineStepProgress("cleanup_remote", "Clean Temporary Remote File", "DELETE /v1beta/files/{id}", StepStatus.PENDING),
                             PipelineStepProgress("save_vault", "Save Daily Note & Archives", "Write 99_Audio_Archive, 98_Transcript_Archive (.md), 01_Daily_Notes", StepStatus.PENDING)
                         ),
@@ -407,7 +451,7 @@ class DmnPipelineOrchestrator(
 
                     val generation = geminiService.processAudioToDmnMarkdown(
                         apiKey = settings.geminiApiKey,
-                        modelId = settings.geminiModel,
+                        modelId = startModel,
                         audioUri = audio.uri,
                         displayName = audio.name,
                         mimeType = audio.mimeType,
@@ -425,7 +469,8 @@ class DmnPipelineOrchestrator(
                         },
                         onStepUpdate = { update ->
                             applyGeminiStepUpdate(update)
-                        }
+                        },
+                        retryControl = retryControl
                     )
 
                     applyVaultStep(
@@ -518,19 +563,23 @@ class DmnPipelineOrchestrator(
             // 2. Process Text Inbox Items
             for (textFile in textTargets) {
                 val nowMs = System.currentTimeMillis()
+                val startModel = batchOverrideModel ?: settings.geminiModel
+                val timeTag = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(nowMs))
                 try {
                     updateJob(textFile.uri.toString(), textFile.name, textFile.sizeBytes, JobStatus.SYNTHESIZING, null, null, null, null, nowMs)
                     _liveStatusMessage.value = "Synthesizing ${textFile.name}..."
                     _activeProcessingProgress.value = ActiveProcessingProgress(
                         fileName = textFile.name,
                         inputKind = "Text Note",
-                        modelId = settings.geminiModel,
+                        modelId = startModel,
                         currentApiCall = "Reading local note ${textFile.name}",
                         currentStatusText = "Loading text input from 04_Text_Inbox...",
+                        requestPayloadSummary = "Local File: ${textFile.name} (${textFile.sizeBytes} bytes)",
+                        attemptHistory = listOf("[$timeTag] Indexed ${existingNodes.size} graph hub(s); starting text synthesis with $startModel"),
                         steps = listOf(
                             PipelineStepProgress("scan_graph", "Index Knowledge Graph", "Loaded ${existingNodes.size} existing [[WikiLink]] hubs", StepStatus.COMPLETED),
                             PipelineStepProgress("read_input", "Load Text Input", "Reading ${textFile.name} (${textFile.sizeBytes} bytes)", StepStatus.IN_PROGRESS),
-                            PipelineStepProgress("generate", "Gemini DMN Synthesis", "POST /v1beta/models/${settings.geminiModel}:generateContent", StepStatus.PENDING),
+                            PipelineStepProgress("generate", "Gemini DMN Synthesis", "POST /v1beta/models/$startModel:generateContent", StepStatus.PENDING),
                             PipelineStepProgress("save_vault", "Save Daily Note & Archive .md", "Write 98_Transcript_Archive (.md) & 01_Daily_Notes", StepStatus.PENDING)
                         ),
                         startedAtMs = nowMs
@@ -550,7 +599,7 @@ class DmnPipelineOrchestrator(
 
                     val generation = geminiService.processTextToDmnMarkdown(
                         apiKey = settings.geminiApiKey,
-                        modelId = settings.geminiModel,
+                        modelId = startModel,
                         rawText = rawText,
                         existingNodes = existingNodes,
                         timestampStr = timeStr,
@@ -565,7 +614,8 @@ class DmnPipelineOrchestrator(
                         },
                         onStepUpdate = { update ->
                             applyGeminiStepUpdate(update)
-                        }
+                        },
+                        retryControl = retryControl
                     )
 
                     applyVaultStep(
@@ -666,6 +716,8 @@ class DmnPipelineOrchestrator(
             }
             Result.success(processedCount)
             } finally {
+                retryControlRef.set(null)
+                batchOverrideModel = null
                 _isProcessing.value = false
                 _liveStatusMessage.value = null
                 _activeProcessingProgress.value = null
@@ -704,8 +756,9 @@ class DmnPipelineOrchestrator(
             result.onSuccess { sum ->
                 settingsRepo.setLastDriveSyncMs(System.currentTimeMillis())
                 refreshVaultAndInbox()
+                val deletedPart = if (sum.deletedRemoteCount > 0) ", ${sum.deletedRemoteCount} deleted" else ""
                 _completionMessages.tryEmit(
-                    "${sum.syncMode}: ${sum.uploadedCount} uploaded, ${sum.downloadedCount} downloaded, ${sum.skippedUnchanged} unchanged"
+                    "${sum.syncMode}: ${sum.uploadedCount} uploaded, ${sum.downloadedCount} downloaded$deletedPart, ${sum.skippedUnchanged} unchanged"
                 )
             }.onFailure { err ->
                 _completionMessages.tryEmit(err.message ?: "Google Drive sync failed.")
@@ -744,12 +797,30 @@ class DmnPipelineOrchestrator(
                 step
             }
         }
+        val activeModel = update.modelId?.takeIf { it.isNotBlank() } ?: current.modelId
+        val nextPendingOverride = if (current.pendingOverrideModel != null && activeModel == current.pendingOverrideModel) {
+            null
+        } else {
+            current.pendingOverrideModel
+        }
+        val updatedHistory = if (!update.historyEvent.isNullOrBlank()) {
+            val timeTag = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            (current.attemptHistory + "[$timeTag] ${update.historyEvent}").takeLast(25)
+        } else {
+            current.attemptHistory
+        }
+
         _activeProcessingProgress.value = current.copy(
+            modelId = activeModel,
             currentApiCall = update.apiCall,
             currentStatusText = update.statusText,
             isRetrying = newStepStatus == StepStatus.RETRYING,
             attemptNumber = update.attemptNumber,
             lastHttpStatusOrError = update.errorDetail ?: if (newStepStatus == StepStatus.COMPLETED) null else current.lastHttpStatusOrError,
+            requestPayloadSummary = update.requestSummary ?: current.requestPayloadSummary,
+            lastResponsePayload = update.responsePayload ?: current.lastResponsePayload,
+            pendingOverrideModel = nextPendingOverride,
+            attemptHistory = updatedHistory,
             steps = updatedSteps
         )
     }

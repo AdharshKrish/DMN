@@ -753,7 +753,7 @@ fun SyncScreen(
                     }
                     Text(
                         text = if (state.settings.syncDirection == SyncDirection.PHONE_TO_DRIVE) {
-                            "Default fast push: checks .synapse_sync_manifest.json and uploads only new or modified files from your phone."
+                            "Mirrors your phone to Drive: uploads new or modified files and removes from Drive any files deleted on your phone."
                         } else {
                             "Uses .synapse_sync_manifest.json and Drive Changes API to transfer only changed files in both directions."
                         },

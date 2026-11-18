@@ -4,7 +4,11 @@ import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,6 +20,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 data class GeminiGenerationResult(
     val markdown: String,
@@ -31,8 +36,53 @@ data class GeminiStepUpdate(
     val statusText: String,
     val stepStatus: String, // "IN_PROGRESS", "RETRYING", "COMPLETED", "FAILED"
     val attemptNumber: Int = 1,
-    val errorDetail: String? = null
+    val errorDetail: String? = null,
+    val modelId: String? = null,
+    val requestSummary: String? = null,
+    val responsePayload: String? = null,
+    val historyEvent: String? = null
 )
+
+class RetryControlChannel {
+    private val pendingModel = AtomicReference<String?>(null)
+    private val immediateRetryRequested = AtomicReference(false)
+    private val wakeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 16)
+    private val activeCall = AtomicReference<Call?>(null)
+
+    fun requestModelSwitch(newModelId: String, interruptActiveCall: Boolean) {
+        val clean = newModelId.trim()
+        if (clean.isBlank()) return
+        pendingModel.set(clean)
+        immediateRetryRequested.set(true)
+        wakeSignal.tryEmit(Unit)
+        if (interruptActiveCall) {
+            activeCall.get()?.cancel()
+        }
+    }
+
+    fun requestImmediateRetry() {
+        immediateRetryRequested.set(true)
+        wakeSignal.tryEmit(Unit)
+    }
+
+    internal fun attachCall(call: Call?) {
+        activeCall.set(call)
+    }
+
+    internal fun hasPendingModel(): Boolean = pendingModel.get() != null
+
+    internal fun consumePendingModel(): String? = pendingModel.getAndSet(null)
+
+    internal fun consumeImmediateRetryFlag(): Boolean = immediateRetryRequested.getAndSet(false)
+
+    internal suspend fun waitOrInterrupt(waitMs: Long): Boolean {
+        if (waitMs <= 0L) return true
+        return withTimeoutOrNull(waitMs) {
+            wakeSignal.first()
+            true
+        } ?: false
+    }
+}
 
 class GeminiApiException(
     message: String,
@@ -176,7 +226,8 @@ class GeminiDmnService(private val context: Context) {
         timestampStr: String,
         onStageChanged: suspend (stage: String) -> Unit,
         onStatusDetail: (suspend (String) -> Unit)? = null,
-        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null
+        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null,
+        retryControl: RetryControlChannel? = null
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
@@ -200,12 +251,13 @@ class GeminiDmnService(private val context: Context) {
             val prompt = buildDmnPrompt(existingNodes, timestampStr)
             val callOutput = callGenerateContent(
                 apiKey = cleanKey,
-                modelId = cleanModel,
+                initialModelId = cleanModel,
                 fileUri = activeFile.uri,
                 mimeType = activeFile.mimeType.ifBlank { mimeType },
                 prompt = prompt,
                 onStatusDetail = onStatusDetail,
-                onStepUpdate = onStepUpdate
+                onStepUpdate = onStepUpdate,
+                retryControl = retryControl
             )
 
             val (cleanTranscript, markdown) = parseAudioDualOutput(callOutput.text)
@@ -218,7 +270,7 @@ class GeminiDmnService(private val context: Context) {
             GeminiGenerationResult(
                 markdown = markdown,
                 rawTranscript = cleanTranscript,
-                modelUsed = cleanModel,
+                modelUsed = callOutput.modelUsed,
                 extractedWikiLinks = links,
                 debugDetails = callOutput.debugDetails
             )
@@ -229,7 +281,8 @@ class GeminiDmnService(private val context: Context) {
                     stepId = "cleanup_remote",
                     apiCall = "DELETE $BASE_URL/v1beta/${uploaded.name}",
                     statusText = "Removing temporary audio from Gemini Files API...",
-                    stepStatus = "IN_PROGRESS"
+                    stepStatus = "IN_PROGRESS",
+                    requestSummary = "DELETE $BASE_URL/v1beta/${uploaded.name}"
                 )
             )
             deleteRemoteFileQuietly(cleanKey, uploaded.name)
@@ -238,7 +291,9 @@ class GeminiDmnService(private val context: Context) {
                     stepId = "cleanup_remote",
                     apiCall = "DELETE $BASE_URL/v1beta/${uploaded.name}",
                     statusText = "Temporary audio removed from Gemini servers",
-                    stepStatus = "COMPLETED"
+                    stepStatus = "COMPLETED",
+                    responsePayload = "HTTP 200 OK (temporary file deleted)",
+                    historyEvent = "Cleaned temporary file ${uploaded.name} from Gemini servers"
                 )
             )
         }
@@ -252,7 +307,8 @@ class GeminiDmnService(private val context: Context) {
         timestampStr: String,
         onStageChanged: suspend (stage: String) -> Unit,
         onStatusDetail: (suspend (String) -> Unit)? = null,
-        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null
+        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null,
+        retryControl: RetryControlChannel? = null
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
@@ -263,12 +319,13 @@ class GeminiDmnService(private val context: Context) {
         val prompt = buildTextDmnPrompt(rawText, existingNodes, timestampStr)
         val callOutput = callGenerateContent(
             apiKey = cleanKey,
-            modelId = cleanModel,
+            initialModelId = cleanModel,
             fileUri = null,
             mimeType = null,
             prompt = prompt,
             onStatusDetail = onStatusDetail,
-            onStepUpdate = onStepUpdate
+            onStepUpdate = onStepUpdate,
+            retryControl = retryControl
         )
 
         val cleanedMarkdown = cleanFences(callOutput.text)
@@ -281,7 +338,7 @@ class GeminiDmnService(private val context: Context) {
         GeminiGenerationResult(
             markdown = cleanedMarkdown,
             rawTranscript = rawText,
-            modelUsed = cleanModel,
+            modelUsed = callOutput.modelUsed,
             extractedWikiLinks = links,
             debugDetails = callOutput.debugDetails
         )
@@ -308,19 +365,21 @@ class GeminiDmnService(private val context: Context) {
         require(actualSize > 0L) { "Audio file is empty or unreadable." }
 
         val startUrl = "$BASE_URL/upload/v1beta/files"
+        val startPayload = JSONObject().put(
+            "file",
+            JSONObject().put("display_name", displayName)
+        ).toString()
+        val startReqSummary = "POST $startUrl\nHeaders: X-Goog-Upload-Protocol=resumable, Command=start, Content-Length=$actualSize, Type=$mimeType\nBody: $startPayload"
+
         onStepUpdate?.invoke(
             GeminiStepUpdate(
                 stepId = "upload_start",
                 apiCall = "POST $startUrl (resumable start)",
                 statusText = "Starting resumable upload session (${actualSize / 1024} KB, $mimeType)...",
-                stepStatus = "IN_PROGRESS"
+                stepStatus = "IN_PROGRESS",
+                requestSummary = startReqSummary
             )
         )
-
-        val startPayload = JSONObject().put(
-            "file",
-            JSONObject().put("display_name", displayName)
-        ).toString()
 
         val startRequest = Request.Builder()
             .url(startUrl)
@@ -333,31 +392,37 @@ class GeminiDmnService(private val context: Context) {
             .build()
 
         val uploadUrl = client.newCall(startRequest).execute().use { response ->
+            val respBody = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                val err = parseGeminiError(response.body?.string()) ?: "HTTP ${response.code}"
+                val err = parseGeminiError(respBody) ?: "HTTP ${response.code}"
+                val rawResp = "HTTP ${response.code} ${response.message}\n${respBody.ifBlank { "(empty)" }.take(2500)}"
                 onStepUpdate?.invoke(
                     GeminiStepUpdate(
                         stepId = "upload_start",
                         apiCall = "POST $startUrl",
                         statusText = "Failed initiating upload: $err",
                         stepStatus = "FAILED",
-                        errorDetail = err
+                        errorDetail = err,
+                        responsePayload = rawResp,
+                        historyEvent = "Resumable upload start failed (HTTP ${response.code}): $err"
                     )
                 )
                 throw IOException("Failed to initiate Gemini audio upload: $err")
             }
-            response.header("X-Goog-Upload-URL")
+            val urlHeader = response.header("X-Goog-Upload-URL")
                 ?: throw IOException("Gemini upload endpoint did not return X-Goog-Upload-URL.")
-        }
-
-        onStepUpdate?.invoke(
-            GeminiStepUpdate(
-                stepId = "upload_start",
-                apiCall = "POST $startUrl",
-                statusText = "Upload session created",
-                stepStatus = "COMPLETED"
+            onStepUpdate?.invoke(
+                GeminiStepUpdate(
+                    stepId = "upload_start",
+                    apiCall = "POST $startUrl",
+                    statusText = "Upload session created",
+                    stepStatus = "COMPLETED",
+                    responsePayload = "HTTP ${response.code} ${response.message}\nX-Goog-Upload-URL: ${urlHeader.take(120)}...\n${respBody.ifBlank { "(session URL returned in header)" }}",
+                    historyEvent = "Initiated Gemini resumable upload session (HTTP ${response.code})"
+                )
             )
-        )
+            urlHeader
+        }
 
         val shortUploadEndpoint = "$BASE_URL/upload/v1beta/files (upload, finalize)"
         onStepUpdate?.invoke(
@@ -365,7 +430,8 @@ class GeminiDmnService(private val context: Context) {
                 stepId = "upload_bytes",
                 apiCall = "POST $shortUploadEndpoint",
                 statusText = "Streaming ${actualSize / 1024} KB audio payload to Gemini Files API...",
-                stepStatus = "IN_PROGRESS"
+                stepStatus = "IN_PROGRESS",
+                requestSummary = "POST $shortUploadEndpoint\nHeaders: X-Goog-Upload-Offset=0, Command=upload, finalize\nStream: $actualSize bytes ($mimeType)"
             )
         )
 
@@ -390,6 +456,7 @@ class GeminiDmnService(private val context: Context) {
 
         return client.newCall(uploadRequest).execute().use { response ->
             val bodyStr = response.body?.string().orEmpty()
+            val rawResp = "HTTP ${response.code} ${response.message}\n${bodyStr.ifBlank { "(empty)" }.take(3000)}"
             if (!response.isSuccessful) {
                 val err = parseGeminiError(bodyStr) ?: "HTTP ${response.code}"
                 onStepUpdate?.invoke(
@@ -398,7 +465,9 @@ class GeminiDmnService(private val context: Context) {
                         apiCall = "POST $shortUploadEndpoint",
                         statusText = "Audio upload failed: $err",
                         stepStatus = "FAILED",
-                        errorDetail = err
+                        errorDetail = err,
+                        responsePayload = rawResp,
+                        historyEvent = "Audio payload upload failed (HTTP ${response.code}): $err"
                     )
                 )
                 throw IOException("Audio upload failed: $err")
@@ -409,7 +478,9 @@ class GeminiDmnService(private val context: Context) {
                     stepId = "upload_bytes",
                     apiCall = "POST $shortUploadEndpoint",
                     statusText = "Uploaded ${actualSize / 1024} KB -> ${parsed.name}",
-                    stepStatus = "COMPLETED"
+                    stepStatus = "COMPLETED",
+                    responsePayload = rawResp,
+                    historyEvent = "Uploaded ${actualSize / 1024} KB -> ${parsed.name} (state=${parsed.state})"
                 )
             )
             parsed
@@ -430,7 +501,8 @@ class GeminiDmnService(private val context: Context) {
                     apiCall = "GET $statusUrl",
                     statusText = "Checking remote file indexing status (poll #$pollNum)...",
                     stepStatus = "IN_PROGRESS",
-                    attemptNumber = pollNum
+                    attemptNumber = pollNum,
+                    requestSummary = "GET $statusUrl"
                 )
             )
             val request = Request.Builder()
@@ -439,8 +511,12 @@ class GeminiDmnService(private val context: Context) {
                 .get()
                 .build()
 
+            var lastRawBody = ""
+            var lastCode = 200
             val fileInfo = client.newCall(request).execute().use { response ->
+                lastCode = response.code
                 val bodyStr = response.body?.string().orEmpty()
+                lastRawBody = "HTTP ${response.code} ${response.message}\n${bodyStr.ifBlank { "(empty)" }.take(2500)}"
                 if (!response.isSuccessful) {
                     val err = parseGeminiError(bodyStr) ?: "HTTP ${response.code}"
                     onStepUpdate?.invoke(
@@ -450,7 +526,9 @@ class GeminiDmnService(private val context: Context) {
                             statusText = "File status check error: $err",
                             stepStatus = "FAILED",
                             attemptNumber = pollNum,
-                            errorDetail = err
+                            errorDetail = err,
+                            responsePayload = lastRawBody,
+                            historyEvent = "File status check #$pollNum failed (HTTP ${response.code}): $err"
                         )
                     )
                     throw IOException("Failed checking uploaded file status: $err")
@@ -468,7 +546,9 @@ class GeminiDmnService(private val context: Context) {
                             apiCall = "GET $statusUrl",
                             statusText = "Remote file state=ACTIVE (ready for synthesis)",
                             stepStatus = "COMPLETED",
-                            attemptNumber = pollNum
+                            attemptNumber = pollNum,
+                            responsePayload = lastRawBody,
+                            historyEvent = "Remote audio $fileName became ACTIVE (poll #$pollNum, HTTP $lastCode)"
                         )
                     )
                     return fileInfo
@@ -481,7 +561,9 @@ class GeminiDmnService(private val context: Context) {
                             statusText = "Gemini returned state=FAILED",
                             stepStatus = "FAILED",
                             attemptNumber = pollNum,
-                            errorDetail = "state=FAILED"
+                            errorDetail = "state=FAILED",
+                            responsePayload = lastRawBody,
+                            historyEvent = "Gemini rejected audio indexing (state=FAILED)"
                         )
                     )
                     throw IOException("Gemini rejected audio processing (state=FAILED).")
@@ -493,7 +575,8 @@ class GeminiDmnService(private val context: Context) {
                             apiCall = "GET $statusUrl",
                             statusText = "Remote state=${fileInfo.state}, waiting 2s (poll #$pollNum)...",
                             stepStatus = "IN_PROGRESS",
-                            attemptNumber = pollNum
+                            attemptNumber = pollNum,
+                            responsePayload = lastRawBody
                         )
                     )
                     delay(2000L)
@@ -505,17 +588,19 @@ class GeminiDmnService(private val context: Context) {
 
     private data class GenerateCallOutput(
         val text: String,
+        val modelUsed: String,
         val debugDetails: String
     )
 
     private suspend fun callGenerateContent(
         apiKey: String,
-        modelId: String,
+        initialModelId: String,
         fileUri: String?,
         mimeType: String?,
         prompt: String,
         onStatusDetail: (suspend (String) -> Unit)? = null,
-        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null
+        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null,
+        retryControl: RetryControlChannel? = null
     ): GenerateCallOutput {
         val partsArray = JSONArray().apply {
             if (!fileUri.isNullOrBlank() && !mimeType.isNullOrBlank()) {
@@ -544,25 +629,45 @@ class GeminiDmnService(private val context: Context) {
         }
 
         val payloadJson = payload.toString()
-        val endpointUrl = "$BASE_URL/v1beta/models/$modelId:generateContent"
+        var activeModel = initialModelId.trim().ifBlank { "gemini-3.5-flash" }
         val startMs = System.currentTimeMillis()
         var attempt = 0
         var lastError: IOException? = null
+        var lastResponsePayload: String? = null
 
         while (true) {
+            retryControl?.consumePendingModel()?.let { newModel ->
+                if (newModel != activeModel) {
+                    activeModel = newModel
+                }
+            }
+            retryControl?.consumeImmediateRetryFlag()
+
             attempt++
+            val endpointUrl = "$BASE_URL/v1beta/models/$activeModel:generateContent"
+            val reqSummary = buildString {
+                appendLine("POST $endpointUrl")
+                appendLine("Model: $activeModel | Attempt: #$attempt | Temperature: 0.2")
+                appendLine("Input: ${mimeType ?: "text/plain"}${if (!fileUri.isNullOrBlank()) " ($fileUri)" else ""}")
+                append("JSON Payload Size: ${payloadJson.length} chars")
+            }
+
             onStepUpdate?.invoke(
                 GeminiStepUpdate(
                     stepId = "generate",
                     apiCall = "POST $endpointUrl",
                     statusText = if (attempt == 1) {
-                        "Sending synthesis request to $modelId (${payloadJson.length} chars)..."
+                        "Sending synthesis request to $activeModel (${payloadJson.length} chars)..."
                     } else {
-                        "Attempt #$attempt in flight to $modelId..."
+                        "Attempt #$attempt in flight to $activeModel..."
                     },
                     stepStatus = if (attempt == 1) "IN_PROGRESS" else "RETRYING",
                     attemptNumber = attempt,
-                    errorDetail = lastError?.message
+                    errorDetail = lastError?.message,
+                    modelId = activeModel,
+                    requestSummary = reqSummary,
+                    responsePayload = lastResponsePayload,
+                    historyEvent = "Attempt #$attempt started -> $activeModel"
                 )
             )
 
@@ -575,177 +680,225 @@ class GeminiDmnService(private val context: Context) {
             var retryWaitMs: Long? = null
             var retryStatusMsg: String? = null
             var retryErrorDetail: String? = null
+            var retryHistoryEvent: String? = null
 
             val callResult = try {
-                client.newCall(request).execute().use { response ->
-                    val bodyStr = response.body?.string().orEmpty()
-                    val elapsedMs = System.currentTimeMillis() - startMs
-                    if (!response.isSuccessful) {
-                        val details = parseGeminiErrorDetails(response.code, modelId, bodyStr)
-                        val isTransient = response.code in TRANSIENT_HTTP_CODES
-                        if (isTransient && elapsedMs < MAX_RETRY_WINDOW_MS) {
-                            val rawBackoff = 5000L * (1L shl (attempt - 1).coerceAtMost(4))
-                            val waitMs = rawBackoff.coerceAtMost(MAX_BACKOFF_MS)
-                                .coerceAtMost((MAX_RETRY_WINDOW_MS - elapsedMs).coerceAtLeast(1000L))
+                val call = client.newCall(request)
+                retryControl?.attachCall(call)
+                try {
+                    call.execute().use { response ->
+                        val bodyStr = response.body?.string().orEmpty()
+                        val rawRespSnapshot = "HTTP ${response.code} ${response.message}\n${bodyStr.ifBlank { "(empty body)" }.take(3500)}"
+                        lastResponsePayload = rawRespSnapshot
+                        val elapsedMs = System.currentTimeMillis() - startMs
+
+                        if (!response.isSuccessful) {
+                            val details = parseGeminiErrorDetails(response.code, activeModel, bodyStr)
+                            val isTransient = response.code in TRANSIENT_HTTP_CODES
+                            val hasQueuedSwitch = retryControl?.hasPendingModel() == true
+                            if ((isTransient || hasQueuedSwitch) && elapsedMs < MAX_RETRY_WINDOW_MS) {
+                                val rawBackoff = 5000L * (1L shl (attempt - 1).coerceAtMost(4))
+                                val waitMs = if (hasQueuedSwitch) {
+                                    0L
+                                } else {
+                                    rawBackoff.coerceAtMost(MAX_BACKOFF_MS)
+                                        .coerceAtMost((MAX_RETRY_WINDOW_MS - elapsedMs).coerceAtLeast(1000L))
+                                }
+                                val elapsedSec = elapsedMs / 1000L
+                                val waitSec = (waitMs / 1000L).coerceAtLeast(0L)
+                                retryWaitMs = if (waitMs > 0L) waitMs else null
+                                retryStatusMsg = if (hasQueuedSwitch) {
+                                    "Switching to queued model after HTTP ${response.code} on $activeModel..."
+                                } else {
+                                    "Gemini $activeModel busy (HTTP ${response.code}), waiting ${waitSec}s before retry #${attempt + 1} (${elapsedSec}s / ${MAX_RETRY_WINDOW_MS / 1000L}s window)..."
+                                }
+                                retryErrorDetail = details
+                                retryHistoryEvent = "Attempt #$attempt ($activeModel) -> HTTP ${response.code}: ${parseGeminiError(bodyStr) ?: response.message}"
+                                lastError = IOException(details)
+                                return@use null
+                            }
                             val elapsedSec = elapsedMs / 1000L
-                            val waitSec = (waitMs / 1000L).coerceAtLeast(1L)
-                            retryWaitMs = waitMs
-                            retryStatusMsg = "Gemini $modelId busy (HTTP ${response.code}), waiting ${waitSec}s before retry #${attempt + 1} (${elapsedSec}s / ${MAX_RETRY_WINDOW_MS / 1000L}s window)..."
-                            retryErrorDetail = details
-                            lastError = IOException(details)
-                            return@use null
+                            val attemptsNote = if (attempt > 1) " (failed after $attempt attempts over ${elapsedSec}s)" else ""
+                            val hint = when {
+                                response.code == 503 || response.code == 429 ->
+                                    "\nTip: Try gemini-3.5-flash or gemini-3.5-flash-lite, or tap Load My Key's Models in Sync."
+                                details.contains("no longer available", ignoreCase = true) ->
+                                    "\nTip: Switch to gemini-3.5-flash, gemini-3.8-flash, or gemini-3.5-flash-lite in Sync."
+                                else -> ""
+                            }
+                            val debugReport = buildString {
+                                appendLine("Method: POST")
+                                appendLine("Endpoint: $endpointUrl")
+                                appendLine("Model: $activeModel")
+                                appendLine("HTTP Status: ${response.code} ${response.message}")
+                                appendLine("Attempts: $attempt")
+                                appendLine("Elapsed: ${elapsedSec}s")
+                                appendLine("Input Type: ${mimeType ?: "text/plain"}")
+                                if (!fileUri.isNullOrBlank()) appendLine("Attached File URI: $fileUri")
+                                appendLine("Payload Size: ${payloadJson.length} chars")
+                                appendLine("Response Body:")
+                                append(bodyStr.take(4000).ifBlank { "(empty)" })
+                            }
+                            onStepUpdate?.invoke(
+                                GeminiStepUpdate(
+                                    stepId = "generate",
+                                    apiCall = "POST $endpointUrl",
+                                    statusText = "Failed (HTTP ${response.code}) after $attempt attempt(s)",
+                                    stepStatus = "FAILED",
+                                    attemptNumber = attempt,
+                                    errorDetail = details,
+                                    modelId = activeModel,
+                                    requestSummary = reqSummary,
+                                    responsePayload = rawRespSnapshot,
+                                    historyEvent = "Attempt #$attempt ($activeModel) failed terminally -> HTTP ${response.code}"
+                                )
+                            )
+                            throw GeminiApiException(
+                                message = "Gemini generation error$attemptsNote — $details$hint",
+                                debugDetails = debugReport
+                            )
                         }
-                        val elapsedSec = elapsedMs / 1000L
-                        val attemptsNote = if (attempt > 1) " (failed after $attempt attempts over ${elapsedSec}s)" else ""
-                        val hint = when {
-                            response.code == 503 || response.code == 429 ->
-                                "\nTip: Try gemini-3.5-flash or gemini-3.5-flash-lite, or tap Load My Key's Models in Sync."
-                            details.contains("no longer available", ignoreCase = true) ->
-                                "\nTip: Switch to gemini-3.5-flash, gemini-3.8-flash, or gemini-3.5-flash-lite in Sync."
-                            else -> ""
+
+                        val json = JSONObject(bodyStr)
+                        val promptFeedback = json.optJSONObject("promptFeedback")
+                        val blockReason = promptFeedback?.optString("blockReason")?.takeIf { it.isNotBlank() }
+                        val candidates = json.optJSONArray("candidates")
+                        if (candidates == null || candidates.length() == 0) {
+                            val feedbackStr = promptFeedback?.toString() ?: bodyStr.take(300)
+                            val debugReport = buildString {
+                                appendLine("Method: POST")
+                                appendLine("Endpoint: $endpointUrl")
+                                appendLine("Model: $activeModel")
+                                appendLine("HTTP Status: ${response.code}")
+                                appendLine("Block Reason: ${blockReason ?: "none"}")
+                                appendLine("Response Body:")
+                                append(bodyStr.take(4000))
+                            }
+                            throw GeminiApiException(
+                                message = "Gemini returned no candidates [model=$activeModel" +
+                                    (if (blockReason != null) ", blockReason=$blockReason" else "") +
+                                    "]. Response: $feedbackStr",
+                                debugDetails = debugReport
+                            )
                         }
+
+                        val firstCandidate = candidates.getJSONObject(0)
+                        val finishReason = firstCandidate.optString("finishReason", "")
+                        val contentObj = firstCandidate.optJSONObject("content")
+                        val parts = contentObj?.optJSONArray("parts")
+                        if (parts == null || parts.length() == 0) {
+                            throw GeminiApiException(
+                                message = "Gemini returned empty content [model=$activeModel, finishReason=$finishReason]. Response: ${bodyStr.take(300)}",
+                                debugDetails = "Endpoint: POST $endpointUrl\nHTTP ${response.code}\nFinish Reason: $finishReason\nRaw Response:\n${bodyStr.take(4000)}"
+                            )
+                        }
+
+                        val text = buildString {
+                            for (i in 0 until parts.length()) {
+                                append(parts.getJSONObject(i).optString("text", ""))
+                            }
+                        }.trim()
+
+                        if (text.isEmpty()) {
+                            throw GeminiApiException(
+                                message = "Gemini returned blank text [model=$activeModel, finishReason=$finishReason].",
+                                debugDetails = "Endpoint: POST $endpointUrl\nHTTP ${response.code}\nFinish Reason: $finishReason"
+                            )
+                        }
+
+                        val usage = json.optJSONObject("usageMetadata")
                         val debugReport = buildString {
                             appendLine("Method: POST")
                             appendLine("Endpoint: $endpointUrl")
-                            appendLine("Model: $modelId")
-                            appendLine("HTTP Status: ${response.code} ${response.message}")
+                            appendLine("Model: $activeModel")
+                            appendLine("HTTP Status: ${response.code} OK")
                             appendLine("Attempts: $attempt")
-                            appendLine("Elapsed: ${elapsedSec}s")
+                            appendLine("Duration: ${elapsedMs / 1000.0}s")
+                            appendLine("Finish Reason: ${finishReason.ifBlank { "STOP" }}")
                             appendLine("Input Type: ${mimeType ?: "text/plain"}")
-                            if (!fileUri.isNullOrBlank()) appendLine("Attached File URI: $fileUri")
-                            appendLine("Payload Size: ${payloadJson.length} chars")
-                            appendLine("Response Body:")
-                            append(bodyStr.take(4000).ifBlank { "(empty)" })
+                            if (usage != null) {
+                                appendLine(
+                                    "Tokens — prompt=${usage.optInt("promptTokenCount")}, " +
+                                        "output=${usage.optInt("candidatesTokenCount")}, " +
+                                        "total=${usage.optInt("totalTokenCount")}"
+                                )
+                            }
+                            append("Output Characters: ${text.length}")
                         }
                         onStepUpdate?.invoke(
                             GeminiStepUpdate(
                                 stepId = "generate",
                                 apiCall = "POST $endpointUrl",
-                                statusText = "Failed (HTTP ${response.code}) after $attempt attempt(s)",
-                                stepStatus = "FAILED",
+                                statusText = "HTTP ${response.code} OK (${text.length} chars generated via $activeModel)",
+                                stepStatus = "COMPLETED",
                                 attemptNumber = attempt,
-                                errorDetail = details
+                                modelId = activeModel,
+                                requestSummary = reqSummary,
+                                responsePayload = rawRespSnapshot,
+                                historyEvent = "Attempt #$attempt ($activeModel) succeeded -> HTTP ${response.code} OK (${text.length} chars)"
                             )
                         )
-                        throw GeminiApiException(
-                            message = "Gemini generation error$attemptsNote — $details$hint",
-                            debugDetails = debugReport
-                        )
+                        GenerateCallOutput(text = text, modelUsed = activeModel, debugDetails = debugReport)
                     }
-
-                    val json = JSONObject(bodyStr)
-                    val promptFeedback = json.optJSONObject("promptFeedback")
-                    val blockReason = promptFeedback?.optString("blockReason")?.takeIf { it.isNotBlank() }
-                    val candidates = json.optJSONArray("candidates")
-                    if (candidates == null || candidates.length() == 0) {
-                        val feedbackStr = promptFeedback?.toString() ?: bodyStr.take(300)
-                        val debugReport = buildString {
-                            appendLine("Method: POST")
-                            appendLine("Endpoint: $endpointUrl")
-                            appendLine("Model: $modelId")
-                            appendLine("HTTP Status: ${response.code}")
-                            appendLine("Block Reason: ${blockReason ?: "none"}")
-                            appendLine("Response Body:")
-                            append(bodyStr.take(4000))
-                        }
-                        throw GeminiApiException(
-                            message = "Gemini returned no candidates [model=$modelId" +
-                                (if (blockReason != null) ", blockReason=$blockReason" else "") +
-                                "]. Response: $feedbackStr",
-                            debugDetails = debugReport
-                        )
-                    }
-
-                    val firstCandidate = candidates.getJSONObject(0)
-                    val finishReason = firstCandidate.optString("finishReason", "")
-                    val contentObj = firstCandidate.optJSONObject("content")
-                    val parts = contentObj?.optJSONArray("parts")
-                    if (parts == null || parts.length() == 0) {
-                        throw GeminiApiException(
-                            message = "Gemini returned empty content [model=$modelId, finishReason=$finishReason]. Response: ${bodyStr.take(300)}",
-                            debugDetails = "Endpoint: POST $endpointUrl\nHTTP ${response.code}\nFinish Reason: $finishReason\nRaw Response:\n${bodyStr.take(4000)}"
-                        )
-                    }
-
-                    val text = buildString {
-                        for (i in 0 until parts.length()) {
-                            append(parts.getJSONObject(i).optString("text", ""))
-                        }
-                    }.trim()
-
-                    if (text.isEmpty()) {
-                        throw GeminiApiException(
-                            message = "Gemini returned blank text [model=$modelId, finishReason=$finishReason].",
-                            debugDetails = "Endpoint: POST $endpointUrl\nHTTP ${response.code}\nFinish Reason: $finishReason"
-                        )
-                    }
-
-                    val usage = json.optJSONObject("usageMetadata")
-                    val debugReport = buildString {
-                        appendLine("Method: POST")
-                        appendLine("Endpoint: $endpointUrl")
-                        appendLine("Model: $modelId")
-                        appendLine("HTTP Status: ${response.code} OK")
-                        appendLine("Attempts: $attempt")
-                        appendLine("Duration: ${elapsedMs / 1000.0}s")
-                        appendLine("Finish Reason: ${finishReason.ifBlank { "STOP" }}")
-                        appendLine("Input Type: ${mimeType ?: "text/plain"}")
-                        if (usage != null) {
-                            appendLine(
-                                "Tokens — prompt=${usage.optInt("promptTokenCount")}, " +
-                                    "output=${usage.optInt("candidatesTokenCount")}, " +
-                                    "total=${usage.optInt("totalTokenCount")}"
-                            )
-                        }
-                        append("Output Characters: ${text.length}")
-                    }
-                    onStepUpdate?.invoke(
-                        GeminiStepUpdate(
-                            stepId = "generate",
-                            apiCall = "POST $endpointUrl",
-                            statusText = "HTTP ${response.code} OK (${text.length} chars generated)",
-                            stepStatus = "COMPLETED",
-                            attemptNumber = attempt
-                        )
-                    )
-                    GenerateCallOutput(text = text, debugDetails = debugReport)
+                } finally {
+                    retryControl?.attachCall(null)
                 }
             } catch (apiEx: GeminiApiException) {
                 throw apiEx
             } catch (ioe: IOException) {
-                val elapsedMs = System.currentTimeMillis() - startMs
-                if (elapsedMs < MAX_RETRY_WINDOW_MS) {
-                    val waitMs = 5000L.coerceAtMost((MAX_RETRY_WINDOW_MS - elapsedMs).coerceAtLeast(1000L))
-                    retryWaitMs = waitMs
-                    retryStatusMsg = "Network timeout/blip (${ioe.javaClass.simpleName}), retrying in ${waitMs / 1000L}s..."
-                    retryErrorDetail = "${ioe.javaClass.simpleName}: ${ioe.message}"
-                    lastError = ioe
+                val switchedModel = retryControl?.consumePendingModel()
+                val manualImmediate = retryControl?.consumeImmediateRetryFlag() == true
+                if (switchedModel != null || manualImmediate) {
+                    val prevModel = activeModel
+                    if (switchedModel != null) activeModel = switchedModel
+                    retryWaitMs = null
+                    retryErrorDetail = "Interrupted attempt on $prevModel to retry with $activeModel"
+                    retryStatusMsg = "Switched model to $activeModel; retrying immediately..."
+                    retryHistoryEvent = "Cancelled $prevModel -> switching immediately to $activeModel"
+                    lastResponsePayload = "Attempt #$attempt on $prevModel interrupted by user to switch model to $activeModel."
+                    lastError = IOException(retryErrorDetail)
                     null
                 } else {
-                    val debugReport = buildString {
-                        appendLine("Method: POST")
-                        appendLine("Endpoint: $endpointUrl")
-                        appendLine("Model: $modelId")
-                        appendLine("Attempts: $attempt")
-                        appendLine("Elapsed: ${elapsedMs / 1000L}s")
-                        appendLine("Exception: ${ioe.javaClass.name}: ${ioe.message}")
-                        lastError?.let { append("Last Transient Error: ${it.message}") }
-                    }
-                    onStepUpdate?.invoke(
-                        GeminiStepUpdate(
-                            stepId = "generate",
-                            apiCall = "POST $endpointUrl",
-                            statusText = "Connection failed after $attempt attempt(s)",
-                            stepStatus = "FAILED",
-                            attemptNumber = attempt,
-                            errorDetail = "${ioe.javaClass.simpleName}: ${ioe.message}"
+                    val elapsedMs = System.currentTimeMillis() - startMs
+                    if (elapsedMs < MAX_RETRY_WINDOW_MS) {
+                        val waitMs = 5000L.coerceAtMost((MAX_RETRY_WINDOW_MS - elapsedMs).coerceAtLeast(1000L))
+                        retryWaitMs = waitMs
+                        retryStatusMsg = "Network timeout/blip (${ioe.javaClass.simpleName}), retrying in ${waitMs / 1000L}s..."
+                        retryErrorDetail = "${ioe.javaClass.simpleName}: ${ioe.message}"
+                        retryHistoryEvent = "Attempt #$attempt ($activeModel) network error -> ${ioe.javaClass.simpleName}: ${ioe.message}"
+                        lastResponsePayload = "Network Error: ${ioe.javaClass.name}: ${ioe.message}"
+                        lastError = ioe
+                        null
+                    } else {
+                        val debugReport = buildString {
+                            appendLine("Method: POST")
+                            appendLine("Endpoint: $endpointUrl")
+                            appendLine("Model: $activeModel")
+                            appendLine("Attempts: $attempt")
+                            appendLine("Elapsed: ${elapsedMs / 1000L}s")
+                            appendLine("Exception: ${ioe.javaClass.name}: ${ioe.message}")
+                            lastError?.let { append("Last Transient Error: ${it.message}") }
+                        }
+                        onStepUpdate?.invoke(
+                            GeminiStepUpdate(
+                                stepId = "generate",
+                                apiCall = "POST $endpointUrl",
+                                statusText = "Connection failed after $attempt attempt(s)",
+                                stepStatus = "FAILED",
+                                attemptNumber = attempt,
+                                errorDetail = "${ioe.javaClass.simpleName}: ${ioe.message}",
+                                modelId = activeModel,
+                                requestSummary = reqSummary,
+                                responsePayload = "${ioe.javaClass.name}: ${ioe.message}",
+                                historyEvent = "Attempt #$attempt ($activeModel) timed out terminally"
+                            )
                         )
-                    )
-                    throw GeminiApiException(
-                        message = "Gemini connection error after $attempt attempt(s) over ${elapsedMs / 1000L}s [model=$modelId]: ${ioe.javaClass.simpleName}: ${ioe.message}",
-                        debugDetails = debugReport,
-                        cause = ioe
-                    )
+                        throw GeminiApiException(
+                            message = "Gemini connection error after $attempt attempt(s) over ${elapsedMs / 1000L}s [model=$activeModel]: ${ioe.javaClass.simpleName}: ${ioe.message}",
+                            debugDetails = debugReport,
+                            cause = ioe
+                        )
+                    }
                 }
             }
 
@@ -759,11 +912,21 @@ class GeminiDmnService(private val context: Context) {
                         statusText = msg,
                         stepStatus = "RETRYING",
                         attemptNumber = attempt,
-                        errorDetail = retryErrorDetail
+                        errorDetail = retryErrorDetail,
+                        modelId = activeModel,
+                        requestSummary = reqSummary,
+                        responsePayload = lastResponsePayload,
+                        historyEvent = retryHistoryEvent
                     )
                 )
             }
-            retryWaitMs?.let { delay(it) }
+            retryWaitMs?.let { waitMs ->
+                if (retryControl != null) {
+                    retryControl.waitOrInterrupt(waitMs)
+                } else {
+                    delay(waitMs)
+                }
+            }
         }
     }
 

@@ -19,6 +19,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -135,6 +136,8 @@ fun StudioScreen(
     onSubmitTextNote: (rawText: String, title: String, extension: String, processImmediately: Boolean) -> Unit,
     onProcessAllNow: () -> Unit,
     onProcessSingle: (String) -> Unit,
+    onSwitchRetryModel: (String, Boolean) -> Unit,
+    onRetryNow: () -> Unit,
     onDeleteInboxAudio: (InboxAudioFile) -> Unit,
     onDeleteInboxText: (InboxTextFile) -> Unit,
     onRefreshInbox: () -> Unit,
@@ -540,6 +543,9 @@ fun StudioScreen(
             progress = state.activeProcessingProgress,
             fallbackStatusMessage = state.liveStatusMessage,
             isProcessing = state.isProcessingAudio || state.isSyncingDrive,
+            availableModels = state.availableGeminiModels,
+            onSwitchModel = onSwitchRetryModel,
+            onRetryNow = onRetryNow,
             onDismiss = { showProgressDialog = false }
         )
     }
@@ -627,7 +633,7 @@ private fun VoiceRecorderHeroCard(
                         label = when (recordingState) {
                             RecordingState.IDLE -> "Unbounded • Offline Ready"
                             RecordingState.RECORDING -> "Recording Live"
-                            RecordingState.PAUSED -> "Paused"
+                            RecordingState.PAUSED -> "Paused • Mic Off"
                         },
                         color = when (recordingState) {
                             RecordingState.IDLE -> sem.amber
@@ -1288,8 +1294,12 @@ private fun ActiveProcessingDialog(
     progress: ActiveProcessingProgress?,
     fallbackStatusMessage: String?,
     isProcessing: Boolean,
+    availableModels: List<String>,
+    onSwitchModel: (String, Boolean) -> Unit,
+    onRetryNow: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
     val sem = LocalSynapseColors.current
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
@@ -1300,6 +1310,20 @@ private fun ActiveProcessingDialog(
                 delay(1000L)
             }
         }
+    }
+
+    val modelSuggestions = remember(availableModels) {
+        (listOf(
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-flash-lite-latest",
+            "gemini-flash-latest"
+        ) + availableModels).distinct()
+    }
+
+    var customModelDraft by remember(progress?.modelId, progress?.pendingOverrideModel) {
+        mutableStateOf(progress?.pendingOverrideModel ?: progress?.modelId.orEmpty())
     }
 
     AlertDialog(
@@ -1313,6 +1337,7 @@ private fun ActiveProcessingDialog(
                 if (progress != null) {
                     val elapsedSec = ((nowMs - progress.startedAtMs).coerceAtLeast(0L) / 1000L)
                     Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -1326,6 +1351,13 @@ private fun ActiveProcessingDialog(
                             color = sem.insightPurple,
                             containerColor = sem.insightPurpleContainer
                         )
+                        if (!progress.pendingOverrideModel.isNullOrBlank()) {
+                            StatusPill(
+                                label = "Next → ${progress.pendingOverrideModel}",
+                                color = sem.emerald,
+                                containerColor = sem.emeraldContainer
+                            )
+                        }
                         Text(
                             text = "${elapsedSec}s",
                             style = MaterialTheme.typography.labelSmall,
@@ -1339,7 +1371,7 @@ private fun ActiveProcessingDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 420.dp)
+                    .heightIn(max = 460.dp)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -1418,6 +1450,22 @@ private fun ActiveProcessingDialog(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
+                            if (!progress.requestPayloadSummary.isNullOrBlank()) {
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = MaterialTheme.shapes.extraSmall,
+                                    color = MaterialTheme.colorScheme.surfaceContainerHigh
+                                ) {
+                                    SelectionContainer {
+                                        Text(
+                                            text = progress.requestPayloadSummary,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.padding(8.dp)
+                                        )
+                                    }
+                                }
+                            }
                             if (!progress.lastHttpStatusOrError.isNullOrBlank()) {
                                 Surface(
                                     modifier = Modifier.fillMaxWidth(),
@@ -1432,6 +1480,175 @@ private fun ActiveProcessingDialog(
                                             modifier = Modifier.padding(8.dp)
                                         )
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // Raw HTTP Response Payload Card
+                    if (!progress.lastResponsePayload.isNullOrBlank()) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "LAST RESPONSE PAYLOAD",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    IconButton(
+                                        onClick = {
+                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                            clipboard.setPrimaryClip(
+                                                ClipData.newPlainText("Gemini Response Payload", progress.lastResponsePayload)
+                                            )
+                                            Toast.makeText(context, "Payload copied", Toast.LENGTH_SHORT).show()
+                                        },
+                                        modifier = Modifier
+                                            .size(36.dp)
+                                            .testTag("copy_response_payload_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Outlined.ContentCopy,
+                                            contentDescription = "Copy response payload",
+                                            modifier = Modifier.size(16.dp),
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                                SelectionContainer {
+                                    Text(
+                                        text = progress.lastResponsePayload,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.testTag("last_response_payload_text")
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Interactive Model Switch & Retry Controls
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "MODEL & RETRY CONTROLS",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = "Switch model for the next retry or interrupt a high-demand wait immediately.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                modelSuggestions.forEach { candidate ->
+                                    FilterChip(
+                                        selected = customModelDraft.trim() == candidate,
+                                        onClick = { customModelDraft = candidate },
+                                        label = { Text(candidate, style = MaterialTheme.typography.labelSmall) }
+                                    )
+                                }
+                            }
+                            OutlinedTextField(
+                                value = customModelDraft,
+                                onValueChange = { customModelDraft = it },
+                                label = { Text("Target Gemini Model") },
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("retry_model_input"),
+                                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            )
+                            val trimmedTarget = customModelDraft.trim()
+                            val isDifferentModel = trimmedTarget.isNotBlank() && trimmedTarget != progress.modelId
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (isDifferentModel) {
+                                    OutlinedButton(
+                                        onClick = { onSwitchModel(trimmedTarget, false) },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .heightIn(min = 48.dp)
+                                            .testTag("queue_retry_model_button"),
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("Queue Next Retry", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                    Button(
+                                        onClick = { onSwitchModel(trimmedTarget, true) },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .heightIn(min = 48.dp)
+                                            .testTag("switch_retry_now_button"),
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("Switch & Retry Now", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                } else if (progress.isRetrying) {
+                                    OutlinedButton(
+                                        onClick = onRetryNow,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 48.dp)
+                                            .testTag("retry_now_button")
+                                    ) {
+                                        Text("Retry Current Call Now")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Chronological Attempt History
+                    if (progress.attemptHistory.isNotEmpty()) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = "WHAT HAPPENED SO FAR",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                progress.attemptHistory.forEach { entry ->
+                                    Text(
+                                        text = "• $entry",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
                                 }
                             }
                         }

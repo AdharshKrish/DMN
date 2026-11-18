@@ -1,11 +1,13 @@
 package com.example
 
 import androidx.test.core.app.ApplicationProvider
+import com.example.audio.DmnAudioRecorder
 import com.example.data.drive.DriveSyncManifest
 import com.example.data.drive.GoogleDriveAuthManager
 import com.example.data.drive.GoogleDriveSyncService
 import com.example.data.drive.ManifestFileEntry
 import com.example.data.gemini.GeminiDmnService
+import com.example.data.gemini.RetryControlChannel
 import com.example.data.local.SyncRecordEntity
 import com.example.data.prefs.SyncDirection
 import com.example.data.prefs.VaultSettings
@@ -316,5 +318,68 @@ class ForceGraphAndPromptTest {
                 matchingRecord
             )
         )
+    }
+
+    @Test
+    fun `one-way mirror deletion computes removed manifest paths and ignores dotfiles`() {
+        val manifestPaths = setOf(
+            ".synapse_sync_manifest.json",
+            "01_Daily_Notes/.obsidian_cache",
+            "01_Daily_Notes/2026-11-18.md",
+            "98_Transcript_Archive/note_1.md",
+            "99_Audio_Archive/rec_1.m4a"
+        )
+        val localPaths = setOf(
+            "01_Daily_Notes/2026-11-18.md"
+        )
+
+        val toDelete = GoogleDriveSyncService.computeLocalDeletionsForMirror(localPaths, manifestPaths)
+        assertEquals(
+            listOf(
+                "98_Transcript_Archive/note_1.md",
+                "99_Audio_Archive/rec_1.m4a"
+            ),
+            toDelete
+        )
+    }
+
+    @Test
+    fun `segmented audio merger helpers preserve monotonic PTS across paused segments`() {
+        val offsetAfterFirst = DmnAudioRecorder.computeNextPtsOffsetUs(
+            currentOffsetUs = 0L,
+            segmentMaxRawPtsUs = 1_500_000L,
+            segmentHeaderDurationUs = 1_523_219L
+        )
+        assertTrue(offsetAfterFirst >= 1_523_219L)
+
+        val offsetFallback = DmnAudioRecorder.computeNextPtsOffsetUs(
+            currentOffsetUs = offsetAfterFirst,
+            segmentMaxRawPtsUs = 800_000L,
+            segmentHeaderDurationUs = 0L
+        )
+        assertTrue(offsetFallback > offsetAfterFirst + 800_000L)
+
+        assertEquals(1_000_001L, DmnAudioRecorder.ensureMonotonicPtsUs(999_000L, 1_000_000L))
+        assertEquals(1_000_001L, DmnAudioRecorder.ensureMonotonicPtsUs(1_000_000L, 1_000_000L))
+        assertEquals(1_050_000L, DmnAudioRecorder.ensureMonotonicPtsUs(1_050_000L, 1_000_000L))
+    }
+
+    @Test
+    fun `retry control channel queues and consumes model switch and immediate retry flags`() {
+        val channel = RetryControlChannel()
+        assertFalse(channel.hasPendingModel())
+        assertNull(channel.consumePendingModel())
+        assertFalse(channel.consumeImmediateRetryFlag())
+
+        channel.requestModelSwitch("  gemini-3.5-flash-lite  ", interruptActiveCall = false)
+        assertTrue(channel.hasPendingModel())
+        assertTrue(channel.consumeImmediateRetryFlag())
+        assertEquals("gemini-3.5-flash-lite", channel.consumePendingModel())
+        assertFalse(channel.hasPendingModel())
+        assertFalse(channel.consumeImmediateRetryFlag())
+
+        channel.requestImmediateRetry()
+        assertFalse(channel.hasPendingModel())
+        assertTrue(channel.consumeImmediateRetryFlag())
     }
 }

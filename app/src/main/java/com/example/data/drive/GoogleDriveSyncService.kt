@@ -37,6 +37,7 @@ data class DriveFolderItem(
 data class DriveSyncSummary(
     val uploadedCount: Int = 0,
     val downloadedCount: Int = 0,
+    val deletedRemoteCount: Int = 0,
     val conflictsResolved: Int = 0,
     val skippedUnchanged: Int = 0,
     val errorCount: Int = 0,
@@ -194,6 +195,17 @@ class GoogleDriveSyncService(
             val timeChanged = abs(remote.remoteModifiedMs - prevRecord.remoteModifiedMs) > 2500L
             val idChanged = remote.id != prevRecord.driveFileId
             return md5Changed || timeChanged || idChanged
+        }
+
+        internal fun computeLocalDeletionsForMirror(
+            localPaths: Set<String>,
+            manifestPaths: Set<String>
+        ): List<String> {
+            return manifestPaths.filter { path ->
+                path.isNotBlank() &&
+                    !path.substringAfterLast('/').startsWith(".") &&
+                    path !in localPaths
+            }.sorted()
         }
     }
 
@@ -393,13 +405,14 @@ class GoogleDriveSyncService(
 
             var uploaded = 0
             var downloaded = 0
+            var deletedRemote = 0
             var conflicts = 0
             var unchanged = 0
             var errors = 0
             val changedPathsLog = mutableListOf<String>()
 
             if (syncDirection == SyncDirection.PHONE_TO_DRIVE) {
-                // Fast Phone -> Drive path: only evaluate local files against manifest timestamps/sizes
+                // Fast Phone -> Drive mirror path: upload new/modified local files & delete files removed locally
                 for (path in localFiles.keys.sorted()) {
                     val local = localFiles[path]!!
                     val manifestEntry = manifest.files[path]
@@ -456,6 +469,36 @@ class GoogleDriveSyncService(
                         )
                     }
                 }
+
+                // Remove from Drive any files present in manifest that were deleted on the phone
+                val remoteOnlyPaths = computeLocalDeletionsForMirror(
+                    localPaths = localFiles.keys,
+                    manifestPaths = manifest.files.keys
+                )
+                for (path in remoteOnlyPaths) {
+                    val staleEntry = manifest.files[path] ?: continue
+                    try {
+                        onStatus("Removing deleted file from Drive: $path")
+                        deleteDriveFileOrTrash(accessToken, staleEntry.id)
+                        manifest.files.remove(path)
+                        syncRecordDao.deleteByPath(path)
+                        deletedRemote++
+                        manifestDirty = true
+                        changedPathsLog.add("DELETE (removed locally): $path")
+                    } catch (e: Exception) {
+                        errors++
+                        log(
+                            level = "ERROR",
+                            message = "Drive deletion failed for $path: ${e.message}",
+                            details = "Mode: ${syncDirection.name}\nPath: $path\nDrive File ID: ${staleEntry.id}\nError: ${e.javaClass.name}: ${e.message}"
+                        )
+                    }
+                }
+
+                // Clean up any orphaned local Room sync records absent from phone and manifest
+                previousRecords.keys
+                    .filter { it !in localFiles.keys && it !in manifest.files.keys }
+                    .forEach { orphanPath -> syncRecordDao.deleteByPath(orphanPath) }
             } else {
                 // Two-Way Sync path using manifest + delta changes
                 val allPaths = (localFiles.keys + manifest.files.keys).sorted()
@@ -599,6 +642,7 @@ class GoogleDriveSyncService(
             val summary = DriveSyncSummary(
                 uploadedCount = uploaded,
                 downloadedCount = downloaded,
+                deletedRemoteCount = deletedRemote,
                 conflictsResolved = conflicts,
                 skippedUnchanged = unchanged,
                 errorCount = errors,
@@ -608,7 +652,7 @@ class GoogleDriveSyncService(
             )
             log(
                 level = if (errors == 0) "SUCCESS" else "INFO",
-                message = "${syncDirection.label} complete: $uploaded uploaded, $downloaded downloaded, $unchanged unchanged",
+                message = "${syncDirection.label} complete: $uploaded uploaded, $downloaded downloaded, $deletedRemote deleted, $unchanged unchanged",
                 details = buildString {
                     appendLine("Mode: ${syncDirection.label} (${syncDirection.name})")
                     appendLine("Manifest: $MANIFEST_FILE_NAME (${manifest.files.size} tracked files)")
@@ -616,9 +660,9 @@ class GoogleDriveSyncService(
                     if (syncDirection == SyncDirection.TWO_WAY) {
                         appendLine("Drive Delta Changes Evaluated: $deltaChangesCount")
                     }
-                    appendLine("Uploaded: $uploaded | Downloaded: $downloaded | Conflicts: $conflicts | Unchanged: $unchanged | Errors: $errors")
+                    appendLine("Uploaded: $uploaded | Downloaded: $downloaded | Deleted on Drive: $deletedRemote | Conflicts: $conflicts | Unchanged: $unchanged | Errors: $errors")
                     if (changedPathsLog.isNotEmpty()) {
-                        appendLine("Transferred Files:")
+                        appendLine("Changed Files:")
                         changedPathsLog.take(40).forEach { appendLine("  - $it") }
                         if (changedPathsLog.size > 40) {
                             appendLine("  ... and ${changedPathsLog.size - 40} more")
@@ -1122,6 +1166,40 @@ class GoogleDriveSyncService(
             vaultRepo.writeRelativeBinaryFile(vaultTreeUri, relativePath, remote.mimeType) { out ->
                 stream.use { it.copyTo(out) }
             }.getOrThrow()
+        }
+    }
+
+    private fun deleteDriveFileOrTrash(accessToken: String, driveFileId: String) {
+        val deleteReq = Request.Builder()
+            .url("$DRIVE_API/$driveFileId")
+            .header("Authorization", "Bearer $accessToken")
+            .delete()
+            .build()
+
+        client.newCall(deleteReq).execute().use { resp ->
+            if (resp.isSuccessful || resp.code == 404 || resp.code == 410) {
+                return
+            }
+            val delBody = resp.body?.string().orEmpty()
+            if (resp.code != 403) {
+                throw DriveHttpException(resp.code, "Drive delete failed (${resp.code}): $delBody")
+            }
+        }
+
+        // Fallback to moving file to Drive Trash if permanent delete returned 403
+        val trashBody = JSONObject().put("trashed", true).toString()
+            .toRequestBody("application/json; charset=utf-8".toMediaType())
+        val trashReq = Request.Builder()
+            .url("$DRIVE_API/$driveFileId")
+            .header("Authorization", "Bearer $accessToken")
+            .patch(trashBody)
+            .build()
+        client.newCall(trashReq).execute().use { resp ->
+            if (resp.isSuccessful || resp.code == 404 || resp.code == 410) {
+                return
+            }
+            val body = resp.body?.string().orEmpty()
+            throw DriveHttpException(resp.code, "Drive trash failed (${resp.code}): $body")
         }
     }
 

@@ -323,7 +323,13 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
 
     fun pauseRecording() = app.audioRecorder.pauseRecording()
 
-    fun resumeRecording() = app.audioRecorder.resumeRecording()
+    fun resumeRecording() {
+        app.audioRecorder.resumeRecording().onFailure { err ->
+            viewModelScope.launch {
+                _snackbarMessages.emit("Could not resume microphone: ${err.message}. Recorded segments are preserved.")
+            }
+        }
+    }
 
     fun discardRecording() {
         app.audioRecorder.stopAndDiscard()
@@ -509,6 +515,14 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             )
             _snackbarMessages.emit("Synthesizing item in background (safe to minimize app).")
         }
+    }
+
+    fun switchModelForNextRetry(newModelId: String, retryImmediately: Boolean) {
+        app.pipelineOrchestrator.switchModelForActiveRetry(newModelId, retryImmediately)
+    }
+
+    fun triggerImmediateRetryNow() {
+        app.pipelineOrchestrator.triggerImmediateRetryNow()
     }
 
     fun clearCompletedJobs() {

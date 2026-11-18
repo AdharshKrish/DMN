@@ -181,6 +181,8 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                     onSubmitTextNote = viewModel::submitTextToQueue,
                                     onProcessAllNow = viewModel::processAllInboxNow,
                                     onProcessSingle = viewModel::processSingleInboxItemNow,
+                                    onSwitchRetryModel = viewModel::switchModelForNextRetry,
+                                    onRetryNow = viewModel::triggerImmediateRetryNow,
                                     onDeleteInboxAudio = viewModel::deleteInboxAudio,
                                     onDeleteInboxText = viewModel::deleteInboxText,
                                     onRefreshInbox = viewModel::refreshAll,
