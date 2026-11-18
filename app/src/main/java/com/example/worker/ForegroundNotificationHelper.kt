@@ -44,7 +44,12 @@ object ForegroundNotificationHelper {
         contentText: String
     ): ForegroundInfo {
         ensureChannel(context)
-        val notification = buildNotification(context, title, contentText)
+        val notification = buildNotification(
+            context = context,
+            title = title,
+            contentText = contentText,
+            ongoing = true
+        )
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ForegroundInfo(
                 notificationId,
@@ -60,7 +65,8 @@ object ForegroundNotificationHelper {
         context: Context,
         notificationId: Int,
         title: String,
-        contentText: String
+        contentText: String,
+        ongoing: Boolean = false
     ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = ContextCompat.checkSelfPermission(
@@ -72,20 +78,38 @@ object ForegroundNotificationHelper {
         runCatching {
             ensureChannel(context)
             val manager = context.getSystemService(NotificationManager::class.java) ?: return
-            manager.notify(notificationId, buildNotification(context, title, contentText))
+            manager.notify(
+                notificationId,
+                buildNotification(
+                    context = context,
+                    title = title,
+                    contentText = contentText,
+                    ongoing = ongoing
+                )
+            )
+        }
+    }
+
+    fun cancelNotification(context: Context, notificationId: Int) {
+        runCatching {
+            val manager = context.getSystemService(NotificationManager::class.java) ?: return
+            manager.cancel(notificationId)
         }
     }
 
     private fun buildNotification(
         context: Context,
         title: String,
-        contentText: String
+        contentText: String,
+        ongoing: Boolean
     ) = NotificationCompat.Builder(context, CHANNEL_ID)
-        .setSmallIcon(R.mipmap.ic_launcher)
+        .setSmallIcon(R.drawable.ic_notification_synapse)
+        .setColor(0xFF8FB4FF.toInt())
         .setContentTitle(title)
         .setContentText(contentText)
         .setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
-        .setOngoing(true)
+        .setOngoing(ongoing)
+        .setAutoCancel(!ongoing)
         .setOnlyAlertOnce(true)
         .setSilent(true)
         .setProgress(0, 0, true)

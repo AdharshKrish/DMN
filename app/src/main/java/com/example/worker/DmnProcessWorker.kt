@@ -4,7 +4,12 @@ import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.example.SynapseApplication
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DmnProcessWorker(
     appContext: Context,
@@ -31,7 +36,7 @@ class DmnProcessWorker(
             return Result.failure()
         }
 
-        runCatching {
+        val foregroundActive = runCatching {
             setForeground(
                 ForegroundNotificationHelper.createForegroundInfo(
                     context = applicationContext,
@@ -40,20 +45,37 @@ class DmnProcessWorker(
                     contentText = "Synthesizing audio & text notes with Gemini..."
                 )
             )
-        }
+            true
+        }.getOrDefault(false)
 
-        val statusObserverJob = kotlinx.coroutines.coroutineScope {
+        val acceptingUpdates = AtomicBoolean(true)
+
+        return coroutineScope {
             val watcher = launch {
-                app.pipelineOrchestrator.liveStatusMessage.collect { detail ->
-                    if (!detail.isNullOrBlank()) {
-                        ForegroundNotificationHelper.updateProgressNotification(
-                            context = applicationContext,
-                            notificationId = ForegroundNotificationHelper.NOTIFICATION_ID_DMN,
-                            title = "Synapse DMN Processing",
-                            contentText = detail
-                        )
+                app.pipelineOrchestrator.liveStatusMessage
+                    .collect { detail ->
+                        if (!acceptingUpdates.get() || detail.isNullOrBlank()) return@collect
+                        if (foregroundActive) {
+                            runCatching {
+                                setForeground(
+                                    ForegroundNotificationHelper.createForegroundInfo(
+                                        context = applicationContext,
+                                        notificationId = ForegroundNotificationHelper.NOTIFICATION_ID_DMN,
+                                        title = "Synapse DMN Processing",
+                                        contentText = detail
+                                    )
+                                )
+                            }
+                        } else {
+                            ForegroundNotificationHelper.updateProgressNotification(
+                                context = applicationContext,
+                                notificationId = ForegroundNotificationHelper.NOTIFICATION_ID_DMN,
+                                title = "Synapse DMN Processing",
+                                contentText = detail,
+                                ongoing = false
+                            )
+                        }
                     }
-                }
             }
             try {
                 val singleUri = inputData.getString(KEY_SINGLE_TARGET_URI)
@@ -69,10 +91,15 @@ class DmnProcessWorker(
                     Result.failure()
                 }
             } finally {
-                watcher.cancel()
+                acceptingUpdates.set(false)
+                withContext(NonCancellable) {
+                    watcher.cancelAndJoin()
+                    ForegroundNotificationHelper.cancelNotification(
+                        applicationContext,
+                        ForegroundNotificationHelper.NOTIFICATION_ID_DMN
+                    )
+                }
             }
         }
-
-        return statusObserverJob
     }
 }

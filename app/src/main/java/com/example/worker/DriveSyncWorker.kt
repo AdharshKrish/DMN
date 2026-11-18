@@ -4,8 +4,12 @@ import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.example.SynapseApplication
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DriveSyncWorker(
     appContext: Context,
@@ -28,7 +32,7 @@ class DriveSyncWorker(
             return Result.failure()
         }
 
-        runCatching {
+        val foregroundActive = runCatching {
             setForeground(
                 ForegroundNotificationHelper.createForegroundInfo(
                     context = applicationContext,
@@ -37,20 +41,37 @@ class DriveSyncWorker(
                     contentText = "Comparing vault metadata manifest..."
                 )
             )
-        }
+            true
+        }.getOrDefault(false)
+
+        val acceptingUpdates = AtomicBoolean(true)
 
         return coroutineScope {
             val watcher = launch {
-                app.pipelineOrchestrator.liveStatusMessage.collect { detail ->
-                    if (!detail.isNullOrBlank()) {
-                        ForegroundNotificationHelper.updateProgressNotification(
-                            context = applicationContext,
-                            notificationId = ForegroundNotificationHelper.NOTIFICATION_ID_DRIVE,
-                            title = "Synapse Google Drive Sync",
-                            contentText = detail
-                        )
+                app.pipelineOrchestrator.liveStatusMessage
+                    .collect { detail ->
+                        if (!acceptingUpdates.get() || detail.isNullOrBlank()) return@collect
+                        if (foregroundActive) {
+                            runCatching {
+                                setForeground(
+                                    ForegroundNotificationHelper.createForegroundInfo(
+                                        context = applicationContext,
+                                        notificationId = ForegroundNotificationHelper.NOTIFICATION_ID_DRIVE,
+                                        title = "Synapse Google Drive Sync",
+                                        contentText = detail
+                                    )
+                                )
+                            }
+                        } else {
+                            ForegroundNotificationHelper.updateProgressNotification(
+                                context = applicationContext,
+                                notificationId = ForegroundNotificationHelper.NOTIFICATION_ID_DRIVE,
+                                title = "Synapse Google Drive Sync",
+                                contentText = detail,
+                                ongoing = false
+                            )
+                        }
                     }
-                }
             }
             try {
                 val outcome = app.pipelineOrchestrator.runDriveSync()
@@ -67,7 +88,14 @@ class DriveSyncWorker(
                     }
                 }
             } finally {
-                watcher.cancel()
+                acceptingUpdates.set(false)
+                withContext(NonCancellable) {
+                    watcher.cancelAndJoin()
+                    ForegroundNotificationHelper.cancelNotification(
+                        applicationContext,
+                        ForegroundNotificationHelper.NOTIFICATION_ID_DRIVE
+                    )
+                }
             }
         }
     }
