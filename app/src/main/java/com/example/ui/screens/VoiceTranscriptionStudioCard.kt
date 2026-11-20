@@ -79,11 +79,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.automirrored.outlined.ArrowForward
+import androidx.compose.material.icons.outlined.Bolt
+import com.example.audio.BatchPipelineStage
 import com.example.audio.LiveEngineMode
 import com.example.audio.LiveStudioSessionState
 import com.example.audio.PcmAudioEncoder
 import com.example.audio.RecordingState
 import com.example.data.local.VoiceDraftEntity
+import com.example.data.prefs.VoiceTranscriptionMode
 import com.example.ui.components.StatusPill
 import com.example.ui.components.formatDurationMs
 import com.example.ui.components.formatRelativeTimestamp
@@ -92,12 +97,14 @@ import com.example.ui.theme.LocalSynapseColors
 @Composable
 internal fun VoiceTranscriptionStudioCard(
     liveSession: LiveStudioSessionState,
+    selectedMode: VoiceTranscriptionMode,
     liveModelName: String,
     transcribeModelName: String,
     flashModelName: String,
     vaultConfigured: Boolean,
     geminiConfigured: Boolean,
     permissionDeniedNotice: Boolean,
+    onSelectMode: (VoiceTranscriptionMode) -> Unit,
     onRecordOrContinueTap: () -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
@@ -134,8 +141,11 @@ internal fun VoiceTranscriptionStudioCard(
         if (full.isEmpty()) 0 else full.split(Regex("""\s+""")).size
     }
 
+    val isBatchRamblerSelected = selectedMode == VoiceTranscriptionMode.BATCH_RAMBLER
+
     val activeBorder = when {
         isRecording && liveSession.engineMode == LiveEngineMode.LIVE_STREAMING -> sem.emerald.copy(alpha = pulseAlpha)
+        isRecording && liveSession.engineMode == LiveEngineMode.BATCH_RAMBLER_RECORDING -> MaterialTheme.colorScheme.primary.copy(alpha = pulseAlpha)
         isRecording -> sem.recordingCrimson.copy(alpha = pulseAlpha)
         isPaused || hasPendingAudio -> sem.amber.copy(alpha = 0.65f)
         else -> sem.cardBorder
@@ -144,31 +154,49 @@ internal fun VoiceTranscriptionStudioCard(
     val pillLabel = when (liveSession.engineMode) {
         LiveEngineMode.LIVE_STREAMING -> "Live • $liveModelName"
         LiveEngineMode.CONNECTING_LIVE -> "Connecting Live..."
+        LiveEngineMode.BATCH_RAMBLER_RECORDING -> when (liveSession.batchPipelineStage) {
+            BatchPipelineStage.STEP_1_TRANSCRIBING -> "Step 1/2 • Transcribing"
+            BatchPipelineStage.STEP_2_RAMBLER_CLEANUP -> "Step 2/2 • Rambler Polish"
+            BatchPipelineStage.IDLE -> "Batch • Rambler Mode"
+        }
         LiveEngineMode.BATCH_FALLBACK -> "Batched • $transcribeModelName"
         LiveEngineMode.OFFLINE_RECORDING -> "Offline • Voice Safe"
         LiveEngineMode.PAUSED_MIC_OFF -> "Paused • Mic Off"
-        LiveEngineMode.FINALIZING -> "Finishing Transcription..."
+        LiveEngineMode.FINALIZING -> when (liveSession.batchPipelineStage) {
+            BatchPipelineStage.STEP_1_TRANSCRIBING -> "Step 1/2 • Transcribing..."
+            BatchPipelineStage.STEP_2_RAMBLER_CLEANUP -> "Step 2/2 • Rambler Polish..."
+            BatchPipelineStage.IDLE -> "Finishing Transcription..."
+        }
         LiveEngineMode.IDLE -> when {
             hasPendingAudio -> "Draft Saved • Audio Safe"
             liveSession.confirmedTranscript.isNotBlank() -> "Draft Saved • Ready"
-            else -> "Live-First • Zero-Loss"
+            isBatchRamblerSelected -> "Batch • 2-Step Rambler"
+            else -> "Live • Direct Output"
         }
     }
 
     val pillColor = when (liveSession.engineMode) {
         LiveEngineMode.LIVE_STREAMING -> sem.emerald
+        LiveEngineMode.BATCH_RAMBLER_RECORDING, LiveEngineMode.FINALIZING -> MaterialTheme.colorScheme.primary
         LiveEngineMode.CONNECTING_LIVE, LiveEngineMode.BATCH_FALLBACK,
         LiveEngineMode.OFFLINE_RECORDING, LiveEngineMode.PAUSED_MIC_OFF -> sem.amber
-        LiveEngineMode.FINALIZING -> MaterialTheme.colorScheme.primary
-        LiveEngineMode.IDLE -> if (hasPendingAudio) sem.amber else sem.emerald
+        LiveEngineMode.IDLE -> when {
+            hasPendingAudio -> sem.amber
+            isBatchRamblerSelected -> MaterialTheme.colorScheme.primary
+            else -> sem.emerald
+        }
     }
 
     val pillBg = when (liveSession.engineMode) {
         LiveEngineMode.LIVE_STREAMING -> sem.emeraldContainer
+        LiveEngineMode.BATCH_RAMBLER_RECORDING, LiveEngineMode.FINALIZING -> MaterialTheme.colorScheme.primaryContainer
         LiveEngineMode.CONNECTING_LIVE, LiveEngineMode.BATCH_FALLBACK,
         LiveEngineMode.OFFLINE_RECORDING, LiveEngineMode.PAUSED_MIC_OFF -> sem.amberContainer
-        LiveEngineMode.FINALIZING -> MaterialTheme.colorScheme.primaryContainer
-        LiveEngineMode.IDLE -> if (hasPendingAudio) sem.amberContainer else sem.emeraldContainer
+        LiveEngineMode.IDLE -> when {
+            hasPendingAudio -> sem.amberContainer
+            isBatchRamblerSelected -> MaterialTheme.colorScheme.primaryContainer
+            else -> sem.emeraldContainer
+        }
     }
 
     Card(
@@ -209,6 +237,17 @@ internal fun VoiceTranscriptionStudioCard(
                     color = MaterialTheme.colorScheme.onSurface
                 )
             }
+
+            // Switchable Transcription Mode Selector: Live Transcribe vs Batch + Rambler (2-step)
+            VoiceModeToggleBar(
+                selectedMode = selectedMode,
+                enabled = !isRecording && !liveSession.isBusyTranscribingPending && !liveSession.isSubmittingForDmn,
+                liveModelName = liveModelName,
+                transcribeModelName = transcribeModelName,
+                flashModelName = flashModelName,
+                activeBatchStage = liveSession.batchPipelineStage,
+                onSelectMode = onSelectMode
+            )
 
             // Live -> Batched Fallback Notice with Retry Live option
             AnimatedVisibility(visible = !liveSession.fallbackNotice.isNullOrBlank()) {
@@ -256,6 +295,7 @@ internal fun VoiceTranscriptionStudioCard(
             if (!isIdle || !liveSession.hasContent) {
                 val barActiveColor = when {
                     isRecording && liveSession.engineMode == LiveEngineMode.LIVE_STREAMING -> sem.emerald
+                    isRecording && liveSession.engineMode == LiveEngineMode.BATCH_RAMBLER_RECORDING -> MaterialTheme.colorScheme.primary
                     isRecording -> sem.amber
                     else -> MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
                 }
@@ -415,6 +455,7 @@ internal fun VoiceTranscriptionStudioCard(
                             Text(
                                 text = when (liveSession.engineMode) {
                                     LiveEngineMode.OFFLINE_RECORDING -> "Recording voice safely to device storage. Add your API key or reconnect later to transcribe."
+                                    LiveEngineMode.BATCH_RAMBLER_RECORDING -> "Speak freely — Step 1 transcribes via $transcribeModelName, Step 2 applies Rambler cleanup via $flashModelName before displaying."
                                     LiveEngineMode.BATCH_FALLBACK -> "Speak freely — transcribing in progressive batches via $transcribeModelName while buffering audio safely..."
                                     else -> "Listening... Your speech will appear here in real time."
                                 },
@@ -586,13 +627,13 @@ internal fun VoiceTranscriptionStudioCard(
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.FiberManualRecord,
-                                contentDescription = "Start Live Transcription",
+                                contentDescription = if (isBatchRamblerSelected) "Start Batch + Rambler" else "Start Live Transcription",
                                 tint = sem.amber,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Start Live Transcription",
+                                text = if (isBatchRamblerSelected) "Start Batch + Rambler" else "Start Live Transcription",
                                 style = MaterialTheme.typography.titleSmall
                             )
                         }
@@ -687,6 +728,216 @@ internal fun VoiceTranscriptionStudioCard(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun VoiceModeToggleBar(
+    selectedMode: VoiceTranscriptionMode,
+    enabled: Boolean,
+    liveModelName: String,
+    transcribeModelName: String,
+    flashModelName: String,
+    activeBatchStage: BatchPipelineStage,
+    onSelectMode: (VoiceTranscriptionMode) -> Unit
+) {
+    val sem = LocalSynapseColors.current
+    val isLive = selectedMode == VoiceTranscriptionMode.LIVE
+    val isBatch = selectedMode == VoiceTranscriptionMode.BATCH_RAMBLER
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerLowest,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(enabled = enabled) { onSelectMode(VoiceTranscriptionMode.LIVE) }
+                        .testTag("voice_mode_live"),
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (isLive) sem.emeraldContainer else Color.Transparent,
+                    border = if (isLive) BorderStroke(1.dp, sem.emerald.copy(alpha = 0.65f)) else null
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Bolt,
+                            contentDescription = "Live Transcribe mode",
+                            tint = if (isLive) sem.emerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column {
+                            Text(
+                                text = "Live Transcribe",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = if (isLive) FontWeight.Bold else FontWeight.Medium,
+                                color = if (isLive) sem.emerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "Direct live output",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(enabled = enabled) { onSelectMode(VoiceTranscriptionMode.BATCH_RAMBLER) }
+                        .testTag("voice_mode_batch_rambler"),
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (isBatch) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                    border = if (isBatch) BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)) else null
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.AutoAwesome,
+                            contentDescription = "Batch Rambler mode",
+                            tint = if (isBatch) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column {
+                            Text(
+                                text = "Batch • Rambler",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = if (isBatch) FontWeight.Bold else FontWeight.Medium,
+                                color = if (isBatch) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "2-step clean prose",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isBatch) {
+            val step1Active = activeBatchStage == BatchPipelineStage.STEP_1_TRANSCRIBING
+            val step2Active = activeBatchStage == BatchPipelineStage.STEP_2_RAMBLER_CLEANUP
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("batch_rambler_pipeline_strip"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Surface(
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (step1Active) sem.amberContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                    border = BorderStroke(
+                        1.dp,
+                        if (step1Active) sem.amber else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        if (step1Active) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(11.dp),
+                                strokeWidth = 1.8.dp,
+                                color = sem.amber
+                            )
+                        }
+                        Text(
+                            text = "1. $transcribeModelName",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (step1Active) FontWeight.Bold else FontWeight.Medium,
+                            color = if (step1Active) sem.amber else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.ArrowForward,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(14.dp)
+                )
+
+                Surface(
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (step2Active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                    border = BorderStroke(
+                        1.dp,
+                        if (step2Active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        if (step2Active) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(11.dp),
+                                strokeWidth = 1.8.dp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        Text(
+                            text = "2. Rambler ($flashModelName)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (step2Active) FontWeight.Bold else FontWeight.Medium,
+                            color = if (step2Active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        } else {
+            Text(
+                text = "Direct streaming via $liveModelName (auto-falls back to $transcribeModelName if overloaded).",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }

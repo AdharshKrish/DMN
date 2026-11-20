@@ -111,6 +111,7 @@ import com.example.data.local.ProcessingJobEntity
 import com.example.data.local.VoiceDraftEntity
 import com.example.data.pipeline.ActiveProcessingProgress
 import com.example.data.pipeline.StepStatus
+import com.example.data.prefs.VoiceTranscriptionMode
 import com.example.data.vault.InboxAudioFile
 import com.example.data.vault.InboxTextFile
 import com.example.ui.components.SetupChecklistCard
@@ -130,6 +131,7 @@ fun StudioScreen(
     onPickVault: () -> Unit,
     onOpenSyncTab: () -> Unit,
     onStartRecording: (String) -> Unit,
+    onSelectVoiceTranscriptionMode: (VoiceTranscriptionMode) -> Unit,
     onPauseRecording: () -> Unit,
     onResumeRecording: () -> Unit,
     onStopRecordingForReview: () -> Unit,
@@ -293,12 +295,14 @@ fun StudioScreen(
             if (captureMode == StudioCaptureMode.VOICE) {
                 VoiceTranscriptionStudioCard(
                     liveSession = state.liveSession,
+                    selectedMode = state.settings.voiceTranscriptionMode,
                     liveModelName = state.settings.liveTranscriptionModel,
                     transcribeModelName = state.settings.transcriptionModel,
                     flashModelName = state.settings.geminiModel,
                     vaultConfigured = state.settings.isVaultConfigured,
                     geminiConfigured = state.settings.isGeminiConfigured,
                     permissionDeniedNotice = permissionDeniedNotice,
+                    onSelectMode = onSelectVoiceTranscriptionMode,
                     onRecordOrContinueTap = {
                         val hasMic = ContextCompat.checkSelfPermission(
                             context,

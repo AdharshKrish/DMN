@@ -20,6 +20,7 @@ import com.example.data.pipeline.ActiveProcessingProgress
 import com.example.data.prefs.ConflictStrategy
 import com.example.data.prefs.SyncDirection
 import com.example.data.prefs.VaultSettings
+import com.example.data.prefs.VoiceTranscriptionMode
 import com.example.data.vault.ArchivedAudioItem
 import com.example.data.vault.ArchivedTranscript
 import com.example.data.vault.InboxAudioFile
@@ -348,6 +349,12 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         }
     }
 
+    fun setVoiceTranscriptionMode(mode: VoiceTranscriptionMode) {
+        viewModelScope.launch {
+            app.settingsRepo.setVoiceTranscriptionMode(mode)
+        }
+    }
+
     fun startRecording(sessionLabel: String) {
         viewModelScope.launch {
             val settings = app.settingsRepo.currentSettings()
@@ -355,6 +362,8 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
                 apiKey = settings.geminiApiKey,
                 liveModelId = settings.liveTranscriptionModel,
                 transcribeModelId = settings.transcriptionModel,
+                flashModelId = settings.geminiModel,
+                mode = settings.voiceTranscriptionMode,
                 requestedTitle = sessionLabel
             ).onFailure { err ->
                 _snackbarMessages.emit("Could not start recorder: ${err.message}")
@@ -374,7 +383,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             app.liveTranscriptionManager.resumeRecording(
                 apiKey = settings.geminiApiKey,
                 liveModelId = settings.liveTranscriptionModel,
-                transcribeModelId = settings.transcriptionModel
+                transcribeModelId = settings.transcriptionModel,
+                flashModelId = settings.geminiModel,
+                mode = settings.voiceTranscriptionMode
             ).onFailure { err ->
                 _snackbarMessages.emit("Could not resume microphone: ${err.message}. Your saved draft & audio are intact.")
             }
@@ -386,7 +397,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             val settings = app.settingsRepo.currentSettings()
             app.liveTranscriptionManager.stopRecordingForReview(
                 apiKey = settings.geminiApiKey,
-                transcribeModelId = settings.transcriptionModel
+                transcribeModelId = settings.transcriptionModel,
+                flashModelId = settings.geminiModel,
+                mode = settings.voiceTranscriptionMode
             )
         }
     }
@@ -440,11 +453,18 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             val settings = app.settingsRepo.currentSettings()
             val res = app.liveTranscriptionManager.transcribeRemainingForActiveDraft(
                 apiKey = settings.geminiApiKey,
-                transcribeModelId = settings.transcriptionModel
+                transcribeModelId = settings.transcriptionModel,
+                flashModelId = settings.geminiModel,
+                mode = settings.voiceTranscriptionMode
             )
             res.onSuccess { chunks ->
                 if (chunks > 0) {
-                    _snackbarMessages.emit("Transcribed pending audio ($chunks batch(es)). Temp voice audio cleared once safe.")
+                    val detail = if (settings.voiceTranscriptionMode == VoiceTranscriptionMode.BATCH_RAMBLER) {
+                        "Transcribed & Rambler-polished pending audio ($chunks batch(es)). Temp voice audio cleared once safe."
+                    } else {
+                        "Transcribed pending audio ($chunks batch(es)). Temp voice audio cleared once safe."
+                    }
+                    _snackbarMessages.emit(detail)
                 } else {
                     _snackbarMessages.emit("All recorded audio in this draft is already transcribed.")
                 }
@@ -478,7 +498,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
                 if (app.liveTranscriptionManager.sessionState.value.recordingState != RecordingState.IDLE) {
                     app.liveTranscriptionManager.stopRecordingForReview(
                         apiKey = settings.geminiApiKey,
-                        transcribeModelId = settings.transcriptionModel
+                        transcribeModelId = settings.transcriptionModel,
+                        flashModelId = settings.geminiModel,
+                        mode = settings.voiceTranscriptionMode
                     )
                 }
 
@@ -487,7 +509,9 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
                 if (transcribePendingFirst && currentSession.untranscribedBytes > 0L) {
                     val catchUp = app.liveTranscriptionManager.transcribeRemainingForActiveDraft(
                         apiKey = settings.geminiApiKey,
-                        transcribeModelId = settings.transcriptionModel
+                        transcribeModelId = settings.transcriptionModel,
+                        flashModelId = settings.geminiModel,
+                        mode = settings.voiceTranscriptionMode
                     )
                     if (catchUp.isFailure) {
                         _snackbarMessages.emit(

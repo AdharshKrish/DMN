@@ -174,6 +174,7 @@ fun SynapseAppRoot(viewModel: SynapseViewModel) {
                                     onPickVault = { vaultPickerLauncher.launch(null) },
                                     onOpenSyncTab = { activeTab = AppDestination.SYNC },
                                     onStartRecording = viewModel::startRecording,
+                                    onSelectVoiceTranscriptionMode = viewModel::setVoiceTranscriptionMode,
                                     onPauseRecording = viewModel::pauseRecording,
                                     onResumeRecording = viewModel::resumeRecording,
                                     onStopRecordingForReview = viewModel::stopRecordingForReview,

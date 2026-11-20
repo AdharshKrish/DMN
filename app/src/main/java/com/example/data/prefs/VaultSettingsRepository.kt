@@ -25,6 +25,11 @@ enum class SyncDirection(val label: String) {
     TWO_WAY("Two-Way Sync")
 }
 
+enum class VoiceTranscriptionMode(val label: String, val shortLabel: String) {
+    LIVE("Live Transcribe", "Live"),
+    BATCH_RAMBLER("Batch + Rambler", "Batch")
+}
+
 data class VaultSettings(
     val vaultTreeUri: String? = null,
     val vaultDisplayName: String = "",
@@ -32,6 +37,7 @@ data class VaultSettings(
     val geminiModel: String = DEFAULT_GEMINI_MODEL,
     val transcriptionModel: String = DEFAULT_TRANSCRIPTION_MODEL,
     val liveTranscriptionModel: String = DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+    val voiceTranscriptionMode: VoiceTranscriptionMode = VoiceTranscriptionMode.LIVE,
     val autoProcessAudio: Boolean = true,
     val driveConnectedEmail: String? = null,
     val driveFolderId: String? = null,
@@ -65,6 +71,7 @@ class VaultSettingsRepository(private val context: Context) {
         val GEMINI_MODEL = stringPreferencesKey("gemini_model")
         val TRANSCRIPTION_MODEL = stringPreferencesKey("transcription_model")
         val LIVE_TRANSCRIPTION_MODEL = stringPreferencesKey("live_transcription_model")
+        val VOICE_TRANSCRIPTION_MODE = stringPreferencesKey("voice_transcription_mode")
         val AUTO_PROCESS_AUDIO = booleanPreferencesKey("auto_process_audio")
         val DRIVE_CONNECTED_EMAIL = stringPreferencesKey("drive_connected_email")
         val DRIVE_FOLDER_ID = stringPreferencesKey("drive_folder_id")
@@ -85,6 +92,9 @@ class VaultSettingsRepository(private val context: Context) {
         val directionName = prefs[Keys.SYNC_DIRECTION] ?: SyncDirection.PHONE_TO_DRIVE.name
         val direction = runCatching { SyncDirection.valueOf(directionName) }
             .getOrDefault(SyncDirection.PHONE_TO_DRIVE)
+        val voiceModeName = prefs[Keys.VOICE_TRANSCRIPTION_MODE] ?: VoiceTranscriptionMode.LIVE.name
+        val voiceMode = runCatching { VoiceTranscriptionMode.valueOf(voiceModeName) }
+            .getOrDefault(VoiceTranscriptionMode.LIVE)
         VaultSettings(
             vaultTreeUri = prefs[Keys.VAULT_TREE_URI],
             vaultDisplayName = prefs[Keys.VAULT_DISPLAY_NAME] ?: "",
@@ -95,6 +105,7 @@ class VaultSettingsRepository(private val context: Context) {
                 ?: VaultSettings.DEFAULT_TRANSCRIPTION_MODEL,
             liveTranscriptionModel = prefs[Keys.LIVE_TRANSCRIPTION_MODEL]?.takeIf { it.isNotBlank() }
                 ?: VaultSettings.DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+            voiceTranscriptionMode = voiceMode,
             autoProcessAudio = prefs[Keys.AUTO_PROCESS_AUDIO] ?: true,
             driveConnectedEmail = prefs[Keys.DRIVE_CONNECTED_EMAIL],
             driveFolderId = prefs[Keys.DRIVE_FOLDER_ID],
@@ -187,5 +198,9 @@ class VaultSettingsRepository(private val context: Context) {
 
     suspend fun setAudioRetentionDays(days: Int) {
         context.vaultDataStore.edit { it[Keys.AUDIO_RETENTION_DAYS] = days.coerceAtLeast(0) }
+    }
+
+    suspend fun setVoiceTranscriptionMode(mode: VoiceTranscriptionMode) {
+        context.vaultDataStore.edit { it[Keys.VOICE_TRANSCRIPTION_MODE] = mode.name }
     }
 }

@@ -4,18 +4,24 @@ This document explains how Synapse DMN captures raw thoughts (both spoken audio 
 
 ---
 
-## 1. Live-First Speech-to-Transcription Studio (`LiveTranscriptionSessionManager` & `PcmAudioEncoder`)
+## 1. Switchable Live vs. Batch+Rambler Speech-to-Transcription Studio (`LiveTranscriptionSessionManager` & `PcmAudioEncoder`)
 
-Voice journaling uses a **Live-first → Batched-fallback** architecture built on durable `AudioRecord` 16kHz mono 16-bit PCM recording (`filesDir/voice_drafts/<draftId>/session.pcm`):
+Voice journaling uses durable `AudioRecord` 16kHz mono 16-bit PCM recording (`filesDir/voice_drafts/<draftId>/session.pcm`) with a **switchable mode toggle** right on the Studio recording card (persisted in DataStore):
 
-1. **Live Streaming First (`gemini-3.5-transcribe-live`):** Opens a bidirectional WebSocket (`BidiGenerateContent`) via `GeminiLiveTranscribeClient` and streams raw 16kHz PCM chunks in real time while continuously recording every sample to durable internal storage.
-2. **Automatic Batched Fallback (`gemini-3.5-transcribe`):** If the Live model returns high-demand (`429`/`503`), rate-limit, quota, `goAway`, or connection errors, recording continues uninterrupted and the session seamlessly switches to progressive batched transcription (~12s chunks or 6s + silence splits via inline WAV `generateContent` calls) so the user still sees near-live transcription progress.
-3. **Microphone Release During Pause (`Paused • Mic Off`):** Pausing stops and completely releases `AudioRecord`, extinguishing Android's active microphone indicator, closes the Live WebSocket cleanly, and flushes any trailing audio through `gemini-3.5-transcribe`. Resuming or tapping **Continue Recording** later (even after restarting the app) appends smoothly to the same draft.
+1. **Live Transcribe Mode (`VoiceTranscriptionMode.LIVE`):**
+   - Opens a bidirectional WebSocket (`BidiGenerateContent`) to `gemini-3.5-transcribe-live` via `GeminiLiveTranscribeClient` and displays direct real-time streaming transcription output while buffering PCM safely to disk.
+   - **Automatic Batched Fallback:** If the Live model returns high-demand (`429`/`503`), rate-limit, quota, `goAway`, or connection errors, recording continues uninterrupted and falls back to progressive batched `gemini-3.5-transcribe` chunks so zero speech is lost.
+2. **Batch • Rambler Mode (`VoiceTranscriptionMode.BATCH_RAMBLER` — Two-Step Pipeline):**
+   - Bypasses the Live WebSocket and processes audio in progressive batches (~12s chunks or >=6s + natural pause splits, plus tail flush on Pause/Stop or offline catch-up) through two sequential operations:
+     - **Step 1 (Transcription):** Calls `gemini-3.5-transcribe` (`transcribeInlineWavChunk`) to extract the raw, literal speech text from each WAV slice.
+     - **Step 2 (Rambler LLM Post-Processing):** Passes that raw text (plus the previous 240-char cleaned tail for sentence continuity) into the configured Flash model (default `gemini-3.5-flash`) via `cleanTranscriptRamblerStyle(...)` with a dedicated `system_instruction` prompt, then displays the Rambler-cleaned prose in the transcript box.
+   - If Step 2 fails transiently even after retry, the raw Step 1 transcript is shown instead so zero speech is ever lost.
+3. **Microphone Release During Pause (`Paused • Mic Off`):** Pausing stops and completely releases `AudioRecord`, extinguishing Android's active microphone indicator, closes any Live WebSocket cleanly, and flushes trailing audio (running the 2-step Rambler flow when in Batch mode). Resuming or tapping **Continue** later appends smoothly to the same draft.
 4. **Zero-Loss Voice Audio Backup & Automatic Cleanup:**
    - While recording OR whenever any speech remains untranscribed (e.g., offline mode, network drop, or temporary API outage), `session.pcm` is safely persisted on device alongside exact `transcribedByteOffset` tracking in Room (`voice_drafts`). Reopening the app restores the draft with a **Voice Backup Safe** banner and **Transcribe** catch-up button.
    - Once 100% of recorded audio is transcribed and the transcript is durably saved in Room, the temporary `session.pcm` audio file is automatically deleted — voice recordings are not unnecessarily duplicated into `99_Audio_Archive/`.
-5. **Durable Editable Drafts + Explicit Confirmation Before Flash Synthesis:**
-   - Stopping a recording saves the draft for review and **never** auto-triggers Flash DMN processing.
+5. **Durable Editable Drafts + Explicit Confirmation Before Flash DMN Graph Synthesis:**
+   - Stopping a recording saves the draft for review and **never** auto-triggers Flash DMN Graph processing.
    - Users can close and reopen the app, edit the transcript, switch between multiple saved drafts, or continue recording more speech into a draft.
    - Only after explicit confirmation (**Confirm & Send to Flash**) is the transcript saved to `04_Text_Inbox/` (`Voice_*.md`) and sent to the Flash DMN Graph model.
 
@@ -58,6 +64,23 @@ All inbox processing runs sequentially inside `DmnPipelineOrchestrator.processMu
 - **Vault Context Injection:** Up to `500` existing Daily Note and Atomic Note titles are passed to Gemini as `[[WikiLinks]]` (`$nodesContext`), allowing new sessions to automatically connect to existing concepts in your Obsidian graph.
 - **Dedicated Transcription + Flash Graph Prompt (`buildVoiceTranscriptToDmnPrompt`):** Takes the raw speech transcript produced by `gemini-3.5-transcribe` / `gemini-3.5-transcribe-live` and produces a Rambler-cleaned first-person `### Stream of Consciousness (Cleaned)` section with inline `[[WikiLinks]]` plus the 4-part `### DMN Synthesis & Graph Connections` section (`## DMN Session — $timestampStr`) with strictly zero emojis.
 - **Request Payload Shape:** Requests hit `POST https://generativelanguage.googleapis.com/v1beta/models/{modelId}:generateContent` with `generationConfig.temperature = 0.2`. Transcription calls send pure audio (`inlineData` WAV for batches or `file_data` for inbox audio); Flash graph calls send `contents[0].parts[0].text`.
+
+### Exact Batch Rambler Post-Processing System Prompt (`GeminiDmnService.buildRamblerSystemPrompt`)
+
+Used in **Batch • Rambler** mode as `system_instruction` on `POST /v1beta/models/{flashModelId}:generateContent` (`temperature = 0.15`) immediately after `gemini-3.5-transcribe` produces raw text:
+
+~~~~markdown
+You are a Gboard Rambler-style speech-to-text post-processor.
+Transform raw, literal spoken transcripts into clean, natural, fluent written prose while preserving 100% of the speaker's ideas, vocabulary, reasoning, and first-person ("I") voice.
+
+STRICT RULES:
+1. Remove filler vocalizations ("um", "uh", "er", "ah", "hmm", verbal ticks, and hesitation uses of "like", "you know", "sort of", "I mean").
+2. Fix stutters, false starts, and accidental word or phrase repetitions.
+3. Apply spoken self-corrections seamlessly (e.g., if the speaker says "let's ship Tuesday, wait no, actually Thursday" or "scratch that" / "ignore that", output only the corrected intent rather than transcribing the correction command).
+4. Add clean punctuation, capitalization, and natural sentence/paragraph breaks so the text reads effortlessly.
+5. Do NOT summarize away details, do NOT invent facts, do NOT add headings, bullet lists, [[WikiLinks]], emojis, quotes, or conversational preambles (such as "Here is the cleaned transcript:").
+6. Return ONLY the cleaned prose text itself. If the input contains no meaningful speech, return an empty string.
+~~~~
 
 ### Exact Voice Recording Prompt (`GeminiDmnService.buildDmnPrompt`)
 

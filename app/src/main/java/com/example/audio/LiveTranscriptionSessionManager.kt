@@ -9,6 +9,8 @@ import com.example.data.gemini.GeminiDmnService
 import com.example.data.gemini.GeminiLiveTranscribeClient
 import com.example.data.local.VoiceDraftDao
 import com.example.data.local.VoiceDraftEntity
+import com.example.data.prefs.VaultSettings
+import com.example.data.prefs.VoiceTranscriptionMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,10 +40,17 @@ enum class LiveEngineMode(val label: String) {
     IDLE("Draft Ready"),
     CONNECTING_LIVE("Connecting Live"),
     LIVE_STREAMING("Live Streaming"),
-    BATCH_FALLBACK("Batched Transcribe"),
+    BATCH_RAMBLER_RECORDING("Batch • Rambler"),
+    BATCH_FALLBACK("Batched Fallback"),
     OFFLINE_RECORDING("Offline Safe Audio"),
     PAUSED_MIC_OFF("Paused • Mic Off"),
     FINALIZING("Finishing Transcription")
+}
+
+enum class BatchPipelineStage {
+    IDLE,
+    STEP_1_TRANSCRIBING,
+    STEP_2_RAMBLER_CLEANUP
 }
 
 data class LiveStudioSessionState(
@@ -51,6 +60,7 @@ data class LiveStudioSessionState(
     val elapsedMs: Long = 0L,
     val amplitudes: List<Float> = List(36) { 0.08f },
     val engineMode: LiveEngineMode = LiveEngineMode.IDLE,
+    val batchPipelineStage: BatchPipelineStage = BatchPipelineStage.IDLE,
     val confirmedTranscript: String = "",
     val interimText: String = "",
     val statusMessage: String? = null,
@@ -121,6 +131,8 @@ class LiveTranscriptionSessionManager(
     private var currentApiKey: String = ""
     private var currentLiveModel: String = GeminiDmnService.DEFAULT_LIVE_TRANSCRIBE_MODEL
     private var currentTranscribeModel: String = GeminiDmnService.DEFAULT_TRANSCRIBE_MODEL
+    private var currentFlashModel: String = VaultSettings.DEFAULT_GEMINI_MODEL
+    private var currentMode: VoiceTranscriptionMode = VoiceTranscriptionMode.LIVE
 
     companion object {
         private const val BATCH_TARGET_BYTES = 12L * PcmAudioEncoder.BYTES_PER_SECOND // 12s chunks
@@ -262,6 +274,8 @@ class LiveTranscriptionSessionManager(
         apiKey: String,
         liveModelId: String,
         transcribeModelId: String,
+        flashModelId: String = VaultSettings.DEFAULT_GEMINI_MODEL,
+        mode: VoiceTranscriptionMode = VoiceTranscriptionMode.LIVE,
         requestedTitle: String
     ): Result<Unit> = stateLock.withLock {
         if (_sessionState.value.recordingState == RecordingState.RECORDING) {
@@ -270,6 +284,11 @@ class LiveTranscriptionSessionManager(
         currentApiKey = apiKey.trim()
         currentLiveModel = liveModelId.trim().ifBlank { GeminiDmnService.DEFAULT_LIVE_TRANSCRIBE_MODEL }
         currentTranscribeModel = transcribeModelId.trim().ifBlank { GeminiDmnService.DEFAULT_TRANSCRIBE_MODEL }
+        currentFlashModel = flashModelId.trim().ifBlank { VaultSettings.DEFAULT_GEMINI_MODEL }
+        currentMode = mode
+        if (mode == VoiceTranscriptionMode.BATCH_RAMBLER) {
+            liveFailedInCurrentSession = false
+        }
 
         val current = _sessionState.value
         val draftId = current.activeDraftId ?: UUID.randomUUID().toString()
@@ -306,6 +325,7 @@ class LiveTranscriptionSessionManager(
         val hasApiKey = currentApiKey.isNotBlank()
         val initialEngineMode = when {
             !hasApiKey -> LiveEngineMode.OFFLINE_RECORDING
+            currentMode == VoiceTranscriptionMode.BATCH_RAMBLER -> LiveEngineMode.BATCH_RAMBLER_RECORDING
             liveFailedInCurrentSession -> LiveEngineMode.BATCH_FALLBACK
             else -> LiveEngineMode.CONNECTING_LIVE
         }
@@ -316,9 +336,12 @@ class LiveTranscriptionSessionManager(
                 activeDraftId = draftId,
                 draftTitle = title,
                 engineMode = initialEngineMode,
+                batchPipelineStage = BatchPipelineStage.IDLE,
                 interimText = "",
+                fallbackNotice = if (currentMode == VoiceTranscriptionMode.BATCH_RAMBLER) null else it.fallbackNotice,
                 statusMessage = when (initialEngineMode) {
                     LiveEngineMode.OFFLINE_RECORDING -> "Recording offline — voice safely saved on device until API key is added"
+                    LiveEngineMode.BATCH_RAMBLER_RECORDING -> "Batch Rambler: Step 1 ($currentTranscribeModel) → Step 2 ($currentFlashModel)"
                     LiveEngineMode.BATCH_FALLBACK -> "Recording with Batched $currentTranscribeModel — voice safely backed up"
                     else -> "Connecting to $currentLiveModel (voice safely recording)..."
                 },
@@ -330,10 +353,10 @@ class LiveTranscriptionSessionManager(
         persistActiveDraftInternal()
 
         if (hasApiKey) {
-            if (liveFailedInCurrentSession) {
-                launchBatchTranscribeLoop()
-            } else {
-                launchLiveConnection()
+            when (initialEngineMode) {
+                LiveEngineMode.BATCH_RAMBLER_RECORDING,
+                LiveEngineMode.BATCH_FALLBACK -> launchBatchTranscribeLoop()
+                else -> launchLiveConnection()
             }
         }
         Result.success(Unit)
@@ -348,7 +371,11 @@ class LiveTranscriptionSessionManager(
                     recordingState = RecordingState.PAUSED,
                     engineMode = LiveEngineMode.PAUSED_MIC_OFF,
                     amplitudes = List(36) { 0.08f },
-                    statusMessage = "Paused • Mic released. Flushing remaining speech..."
+                    statusMessage = if (currentMode == VoiceTranscriptionMode.BATCH_RAMBLER) {
+                        "Paused • Mic released. Running 2-step transcribe + Rambler polish on remaining speech..."
+                    } else {
+                        "Paused • Mic released. Flushing remaining speech..."
+                    }
                 )
             }
             true
@@ -360,9 +387,12 @@ class LiveTranscriptionSessionManager(
         batchLoopJob?.cancelAndJoin()
         batchLoopJob = null
 
-        // Flush any untranscribed tail via batched gemini-3.5-transcribe
+        // Flush any untranscribed tail via batched gemini-3.5-transcribe (+ Step 2 Flash Rambler in Batch mode)
         if (currentApiKey.isNotBlank()) {
-            flushPendingPcmSlices(minBytes = MIN_TAIL_FLUSH_BYTES)
+            flushPendingPcmSlices(
+                minBytes = MIN_TAIL_FLUSH_BYTES,
+                applyRamblerCleanup = currentMode == VoiceTranscriptionMode.BATCH_RAMBLER
+            )
         }
 
         stateLock.withLock {
@@ -373,8 +403,11 @@ class LiveTranscriptionSessionManager(
                 val pendingSec = _sessionState.value.untranscribedMs / 1000L
                 _sessionState.update {
                     it.copy(
+                        batchPipelineStage = BatchPipelineStage.IDLE,
                         statusMessage = when {
                             pendingSec > 0L -> "Paused • Mic Off (${pendingSec}s voice safely backed up on device)"
+                            it.confirmedTranscript.isNotBlank() && currentMode == VoiceTranscriptionMode.BATCH_RAMBLER ->
+                                "Paused • Mic Off (Rambler-cleaned & saved)"
                             it.confirmedTranscript.isNotBlank() -> "Paused • Mic Off (100% transcribed & saved)"
                             else -> "Paused • Mic Off"
                         }
@@ -387,28 +420,37 @@ class LiveTranscriptionSessionManager(
     suspend fun resumeRecording(
         apiKey: String,
         liveModelId: String,
-        transcribeModelId: String
+        transcribeModelId: String,
+        flashModelId: String = VaultSettings.DEFAULT_GEMINI_MODEL,
+        mode: VoiceTranscriptionMode = VoiceTranscriptionMode.LIVE
     ): Result<Unit> {
         val title = _sessionState.value.draftTitle
         return startOrContinueRecording(
             apiKey = apiKey,
             liveModelId = liveModelId,
             transcribeModelId = transcribeModelId,
+            flashModelId = flashModelId,
+            mode = mode,
             requestedTitle = title
         )
     }
 
     /**
-     * Stops recording, releases the mic, finishes transcribing any remaining audio segments,
-     * saves the draft persistently in Room (and purges temporary PCM audio ONLY if 100% transcribed & safe).
+     * Stops recording, releases the mic, finishes transcribing any remaining audio segments
+     * (applying Step 2 Rambler Flash cleanup when in Batch mode), saves the draft persistently
+     * in Room (and purges temporary PCM audio ONLY if 100% transcribed & safe).
      * NEVER triggers Flash DMN Graph processing automatically.
      */
     suspend fun stopRecordingForReview(
         apiKey: String,
-        transcribeModelId: String
+        transcribeModelId: String,
+        flashModelId: String = VaultSettings.DEFAULT_GEMINI_MODEL,
+        mode: VoiceTranscriptionMode = currentMode
     ) {
         currentApiKey = apiKey.trim()
         currentTranscribeModel = transcribeModelId.trim().ifBlank { GeminiDmnService.DEFAULT_TRANSCRIBE_MODEL }
+        currentFlashModel = flashModelId.trim().ifBlank { VaultSettings.DEFAULT_GEMINI_MODEL }
+        currentMode = mode
 
         val shouldProceed = stateLock.withLock {
             if (_sessionState.value.recordingState == RecordingState.IDLE) return@withLock false
@@ -418,7 +460,11 @@ class LiveTranscriptionSessionManager(
                     recordingState = RecordingState.IDLE,
                     engineMode = LiveEngineMode.FINALIZING,
                     amplitudes = List(36) { 0.08f },
-                    statusMessage = "Finishing transcription & verifying saved draft..."
+                    statusMessage = if (currentMode == VoiceTranscriptionMode.BATCH_RAMBLER) {
+                        "Finishing 2-step transcription & Rambler polish..."
+                    } else {
+                        "Finishing transcription & verifying saved draft..."
+                    }
                 )
             }
             true
@@ -430,7 +476,10 @@ class LiveTranscriptionSessionManager(
         batchLoopJob = null
 
         if (currentApiKey.isNotBlank()) {
-            flushPendingPcmSlices(minBytes = MIN_TAIL_FLUSH_BYTES)
+            flushPendingPcmSlices(
+                minBytes = MIN_TAIL_FLUSH_BYTES,
+                applyRamblerCleanup = currentMode == VoiceTranscriptionMode.BATCH_RAMBLER
+            )
         }
 
         stateLock.withLock {
@@ -442,8 +491,11 @@ class LiveTranscriptionSessionManager(
             _sessionState.update {
                 it.copy(
                     engineMode = LiveEngineMode.IDLE,
+                    batchPipelineStage = BatchPipelineStage.IDLE,
                     statusMessage = when {
                         pendingSec > 0L -> "Draft saved • ${pendingSec}s voice kept safely on device for later transcription"
+                        st.confirmedTranscript.isNotBlank() && currentMode == VoiceTranscriptionMode.BATCH_RAMBLER ->
+                            "Rambler-polished draft saved • Temp voice audio cleared"
                         st.confirmedTranscript.isNotBlank() -> "Transcription complete & saved • Temp voice audio cleared"
                         else -> "Draft ready"
                     }
@@ -479,12 +531,15 @@ class LiveTranscriptionSessionManager(
     }
 
     /**
-     * Transcribes any remaining untranscribed audio in the active (or specified) draft using
-     * `gemini-3.5-transcribe` in <=45s WAV chunks. Purges temporary PCM audio once 100% safe.
+     * Transcribes any remaining untranscribed audio in the active draft using
+     * `gemini-3.5-transcribe` in <=45s WAV chunks, followed by Flash Rambler cleanup when in
+     * `VoiceTranscriptionMode.BATCH_RAMBLER`. Purges temporary PCM audio once 100% safe.
      */
     suspend fun transcribeRemainingForActiveDraft(
         apiKey: String,
-        transcribeModelId: String
+        transcribeModelId: String,
+        flashModelId: String = VaultSettings.DEFAULT_GEMINI_MODEL,
+        mode: VoiceTranscriptionMode = currentMode
     ): Result<Int> {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) {
@@ -492,6 +547,9 @@ class LiveTranscriptionSessionManager(
         }
         currentApiKey = cleanKey
         currentTranscribeModel = transcribeModelId.trim().ifBlank { GeminiDmnService.DEFAULT_TRANSCRIBE_MODEL }
+        currentFlashModel = flashModelId.trim().ifBlank { VaultSettings.DEFAULT_GEMINI_MODEL }
+        currentMode = mode
+        val useRambler = mode == VoiceTranscriptionMode.BATCH_RAMBLER
 
         if (_sessionState.value.recordingState == RecordingState.RECORDING) {
             return Result.failure(IllegalStateException("Pause or stop recording before running manual catch-up."))
@@ -500,12 +558,19 @@ class LiveTranscriptionSessionManager(
         _sessionState.update {
             it.copy(
                 isBusyTranscribingPending = true,
-                statusMessage = "Transcribing saved audio backup with $currentTranscribeModel..."
+                statusMessage = if (useRambler) {
+                    "Step 1/2: Transcribing saved audio with $currentTranscribeModel → Step 2/2: Rambler polish ($currentFlashModel)..."
+                } else {
+                    "Transcribing saved audio backup with $currentTranscribeModel..."
+                }
             )
         }
 
         return try {
-            val result = flushPendingPcmSlices(minBytes = 1_600L)
+            val result = flushPendingPcmSlices(
+                minBytes = 1_600L,
+                applyRamblerCleanup = useRambler
+            )
             stateLock.withLock {
                 persistActiveDraftInternal()
                 maybePurgeAudioIfCompletelySafe(allowPurgeWhilePaused = true)
@@ -513,9 +578,11 @@ class LiveTranscriptionSessionManager(
                 _sessionState.update {
                     it.copy(
                         isBusyTranscribingPending = false,
+                        batchPipelineStage = BatchPipelineStage.IDLE,
                         statusMessage = when {
                             result.isFailure -> "Audio kept safely on device (${remainingSec}s pending): ${result.exceptionOrNull()?.message}"
                             remainingSec > 0L -> "Audio kept safely on device (${remainingSec}s pending)"
+                            useRambler -> "All speech transcribed & Rambler-polished • Temp voice audio cleared"
                             else -> "All speech transcribed & saved • Temp voice audio cleared"
                         }
                     )
@@ -526,6 +593,7 @@ class LiveTranscriptionSessionManager(
             _sessionState.update {
                 it.copy(
                     isBusyTranscribingPending = false,
+                    batchPipelineStage = BatchPipelineStage.IDLE,
                     statusMessage = "Audio kept safely on device: ${e.message}"
                 )
             }
@@ -835,7 +903,10 @@ class LiveTranscriptionSessionManager(
                 val targetReady = pending >= BATCH_TARGET_BYTES
 
                 if ((targetReady || quietReady) && currentApiKey.isNotBlank()) {
-                    val res = flushPendingPcmSlices(minBytes = BATCH_MIN_SILENCE_BYTES)
+                    val res = flushPendingPcmSlices(
+                        minBytes = BATCH_MIN_SILENCE_BYTES,
+                        applyRamblerCleanup = currentMode == VoiceTranscriptionMode.BATCH_RAMBLER
+                    )
                     if (res.isSuccess) {
                         consecutiveFailures = 0
                     } else {
@@ -848,6 +919,7 @@ class LiveTranscriptionSessionManager(
                         }
                         _sessionState.update { st ->
                             st.copy(
+                                batchPipelineStage = BatchPipelineStage.IDLE,
                                 pendingRetryBatchCount = consecutiveFailures,
                                 statusMessage = "Batch retry in ${backoffMs / 1000L}s (all audio safely stored on device)"
                             )
@@ -876,75 +948,128 @@ class LiveTranscriptionSessionManager(
     }
 
     /**
-     * Transcribes untranscribed PCM bytes [transcribedByteOffset, fileLength) in <=45s WAV chunks
-     * using `gemini-3.5-transcribe`. Never advances `transcribedByteOffset` on failure so zero speech is lost.
+     * Transcribes untranscribed PCM bytes [transcribedByteOffset, fileLength) in <=45s WAV chunks:
+     * - Step 1: `gemini-3.5-transcribe` converts audio into raw literal speech text.
+     *   Never advances `transcribedByteOffset` on failure so zero speech is lost.
+     * - Step 2 (when `applyRamblerCleanup == true`, i.e., Batch mode): passes the raw literal
+     *   segment into the configured Flash model (`gemini-3.5-flash`) with the Rambler system prompt
+     *   before displaying and saving the polished transcript. If Step 2 fails transiently, preserves
+     *   the raw literal text so zero speech is ever lost.
      */
-    private suspend fun flushPendingPcmSlices(minBytes: Long): Result<Int> = batchTranscribeLock.withLock {
+    private suspend fun flushPendingPcmSlices(
+        minBytes: Long,
+        applyRamblerCleanup: Boolean = false
+    ): Result<Int> = batchTranscribeLock.withLock {
         val pcmFile = activePcmFile ?: return@withLock Result.success(0)
         if (!pcmFile.exists()) return@withLock Result.success(0)
 
         runCatching { pcmOutputStream?.flush() }
         var chunksDone = 0
 
-        while (true) {
-            val availableEnd = maxOf(totalPcmBytesWritten, pcmFile.length())
-            val remaining = availableEnd - transcribedByteOffset
-            if (remaining < minBytes) break
+        try {
+            while (true) {
+                val availableEnd = maxOf(totalPcmBytesWritten, pcmFile.length())
+                val remaining = availableEnd - transcribedByteOffset
+                if (remaining < minBytes) break
 
-            val chunkEnd = minOf(availableEnd, transcribedByteOffset + MAX_INLINE_CHUNK_BYTES)
-            val wavBytes = PcmAudioEncoder.readPcmSliceAsWavBytes(pcmFile, transcribedByteOffset, chunkEnd)
-            if (wavBytes.size <= 44) break
+                val chunkEnd = minOf(availableEnd, transcribedByteOffset + MAX_INLINE_CHUNK_BYTES)
+                val wavBytes = PcmAudioEncoder.readPcmSliceAsWavBytes(pcmFile, transcribedByteOffset, chunkEnd)
+                if (wavBytes.size <= 44) break
 
-            _sessionState.update { st ->
-                st.copy(
-                    inFlightBatchCount = st.inFlightBatchCount + 1,
-                    statusMessage = "Transcribing ${(chunkEnd - transcribedByteOffset) / PcmAudioEncoder.BYTES_PER_SECOND}s batch via $currentTranscribeModel..."
-                )
-            }
+                val chunkSec = ((chunkEnd - transcribedByteOffset) / PcmAudioEncoder.BYTES_PER_SECOND).coerceAtLeast(1L)
 
-            val result = geminiService.transcribeInlineWavChunk(
-                apiKey = currentApiKey,
-                transcribeModelId = currentTranscribeModel,
-                wavBytes = wavBytes
-            )
-
-            if (result.isFailure) {
-                val err = result.exceptionOrNull() ?: IllegalStateException("Batch transcription failed")
                 _sessionState.update { st ->
                     st.copy(
-                        inFlightBatchCount = (st.inFlightBatchCount - 1).coerceAtLeast(0),
-                        pendingRetryBatchCount = st.pendingRetryBatchCount + 1
+                        inFlightBatchCount = st.inFlightBatchCount + 1,
+                        batchPipelineStage = BatchPipelineStage.STEP_1_TRANSCRIBING,
+                        statusMessage = if (applyRamblerCleanup) {
+                            "Step 1/2: Transcribing ${chunkSec}s audio via $currentTranscribeModel..."
+                        } else {
+                            "Transcribing ${chunkSec}s batch via $currentTranscribeModel..."
+                        }
                     )
                 }
-                return@withLock Result.failure(err)
-            }
 
-            val segmentText = result.getOrNull().orEmpty().trim()
-            transcribedByteOffset = chunkEnd
-            chunksDone++
-
-            _sessionState.update { st ->
-                val merged = if (segmentText.isNotEmpty()) {
-                    mergeTranscriptText(st.confirmedTranscript, segmentText)
-                } else {
-                    st.confirmedTranscript
-                }
-                st.copy(
-                    confirmedTranscript = merged,
-                    completedBatchCount = st.completedBatchCount + 1,
-                    inFlightBatchCount = (st.inFlightBatchCount - 1).coerceAtLeast(0),
-                    pendingRetryBatchCount = 0,
-                    transcribedByteOffset = transcribedByteOffset,
-                    statusMessage = if (st.recordingState == RecordingState.RECORDING) {
-                        "Batched mode ($currentTranscribeModel) — ${st.completedBatchCount + 1} batch(es) transcribed"
-                    } else {
-                        st.statusMessage
-                    }
+                // Step 1: Raw literal transcription via gemini-3.5-transcribe
+                val step1Result = geminiService.transcribeInlineWavChunk(
+                    apiKey = currentApiKey,
+                    transcribeModelId = currentTranscribeModel,
+                    wavBytes = wavBytes
                 )
+
+                if (step1Result.isFailure) {
+                    val err = step1Result.exceptionOrNull() ?: IllegalStateException("Batch transcription failed")
+                    _sessionState.update { st ->
+                        st.copy(
+                            inFlightBatchCount = (st.inFlightBatchCount - 1).coerceAtLeast(0),
+                            batchPipelineStage = BatchPipelineStage.IDLE,
+                            pendingRetryBatchCount = st.pendingRetryBatchCount + 1
+                        )
+                    }
+                    return@withLock Result.failure(err)
+                }
+
+                val rawSegmentText = step1Result.getOrNull().orEmpty().trim()
+                var ramblerFallbackNote: String? = null
+
+                // Step 2 (Batch Mode only): Rambler-like prose cleanup via Flash model
+                val finalSegmentText = if (applyRamblerCleanup && rawSegmentText.isNotEmpty()) {
+                    _sessionState.update { st ->
+                        st.copy(
+                            batchPipelineStage = BatchPipelineStage.STEP_2_RAMBLER_CLEANUP,
+                            statusMessage = "Step 2/2: Rambler cleanup via $currentFlashModel..."
+                        )
+                    }
+                    val priorContextTail = _sessionState.value.confirmedTranscript.takeLast(240)
+                    val step2Result = geminiService.cleanTranscriptRamblerStyle(
+                        apiKey = currentApiKey,
+                        flashModelId = currentFlashModel,
+                        rawTranscript = rawSegmentText,
+                        priorContextTail = priorContextTail.takeIf { it.isNotBlank() }
+                    )
+                    if (step2Result.isSuccess) {
+                        step2Result.getOrNull().orEmpty().trim().ifBlank { rawSegmentText }
+                    } else {
+                        ramblerFallbackNote = "Flash Rambler cleanup busy — showing raw transcript (no speech lost)"
+                        rawSegmentText
+                    }
+                } else {
+                    rawSegmentText
+                }
+
+                transcribedByteOffset = chunkEnd
+                chunksDone++
+
+                _sessionState.update { st ->
+                    val merged = if (finalSegmentText.isNotEmpty()) {
+                        mergeTranscriptText(st.confirmedTranscript, finalSegmentText)
+                    } else {
+                        st.confirmedTranscript
+                    }
+                    val nextDone = st.completedBatchCount + 1
+                    st.copy(
+                        confirmedTranscript = merged,
+                        completedBatchCount = nextDone,
+                        inFlightBatchCount = (st.inFlightBatchCount - 1).coerceAtLeast(0),
+                        batchPipelineStage = BatchPipelineStage.IDLE,
+                        pendingRetryBatchCount = 0,
+                        transcribedByteOffset = transcribedByteOffset,
+                        statusMessage = when {
+                            ramblerFallbackNote != null -> ramblerFallbackNote
+                            st.recordingState == RecordingState.RECORDING && applyRamblerCleanup ->
+                                "Batch Rambler ($currentTranscribeModel → $currentFlashModel) — $nextDone batch(es) cleaned"
+                            st.recordingState == RecordingState.RECORDING ->
+                                "Batched mode ($currentTranscribeModel) — $nextDone batch(es) transcribed"
+                            else -> st.statusMessage
+                        }
+                    )
+                }
+                persistActiveDraftLocked()
             }
-            persistActiveDraftLocked()
+            Result.success(chunksDone)
+        } finally {
+            _sessionState.update { it.copy(batchPipelineStage = BatchPipelineStage.IDLE) }
         }
-        Result.success(chunksDone)
     }
 
     private fun commitInterimIfAny() {

@@ -1,7 +1,9 @@
 package com.example
 
 import androidx.test.core.app.ApplicationProvider
+import com.example.audio.BatchPipelineStage
 import com.example.audio.DmnAudioRecorder
+import com.example.audio.LiveStudioSessionState
 import com.example.audio.LiveTranscriptionSessionManager
 import com.example.audio.PcmAudioEncoder
 import com.example.data.drive.DriveSyncManifest
@@ -16,6 +18,7 @@ import com.example.data.local.SyncRecordEntity
 import com.example.data.local.VoiceDraftEntity
 import com.example.data.prefs.SyncDirection
 import com.example.data.prefs.VaultSettings
+import com.example.data.prefs.VoiceTranscriptionMode
 import java.io.File
 import com.example.data.vault.GraphEdge
 import com.example.data.vault.GraphNode
@@ -497,5 +500,39 @@ class ForceGraphAndPromptTest {
 
         val safeClearedDraft = pendingDraft.copy(totalPcmBytes = 0L, transcribedByteOffset = 0L)
         assertEquals(0L, safeClearedDraft.untranscribedBytes)
+    }
+
+    @Test
+    fun `batch rambler prompt and payload use system_instruction and preserve continuity context`() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val service = GeminiDmnService(context)
+
+        val sysPrompt = service.buildRamblerSystemPrompt()
+        assertTrue(sysPrompt.contains("Rambler", ignoreCase = true))
+        assertTrue(sysPrompt.contains("self-corrections", ignoreCase = true))
+        assertTrue(sysPrompt.contains("WikiLinks"))
+
+        val payloadJson = service.buildRamblerRequestPayload(
+            rawTranscript = "um so let's ship Tuesday wait no actually Thursday",
+            priorContextTail = "We finished reviewing the roadmap."
+        )
+        val root = org.json.JSONObject(payloadJson)
+        val sysText = root.getJSONObject("system_instruction")
+            .getJSONArray("parts")
+            .getJSONObject(0)
+            .getString("text")
+        assertTrue(sysText.contains("Rambler"))
+
+        val userText = root.getJSONArray("contents")
+            .getJSONObject(0)
+            .getJSONArray("parts")
+            .getJSONObject(0)
+            .getString("text")
+        assertTrue(userText.contains("We finished reviewing the roadmap."))
+        assertTrue(userText.contains("um so let's ship Tuesday wait no actually Thursday"))
+        assertEquals(0.15, root.getJSONObject("generationConfig").getDouble("temperature"), 0.001)
+
+        assertEquals(VoiceTranscriptionMode.LIVE, VaultSettings().voiceTranscriptionMode)
+        assertEquals(BatchPipelineStage.IDLE, LiveStudioSessionState().batchPipelineStage)
     }
 }

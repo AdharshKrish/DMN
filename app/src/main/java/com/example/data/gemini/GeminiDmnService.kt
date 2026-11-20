@@ -284,6 +284,142 @@ class GeminiDmnService(private val context: Context) {
         }
     }
 
+    fun buildRamblerSystemPrompt(): String {
+        return """
+You are a Gboard Rambler-style speech-to-text post-processor.
+Transform raw, literal spoken transcripts into clean, natural, fluent written prose while preserving 100% of the speaker's ideas, vocabulary, reasoning, and first-person ("I") voice.
+
+STRICT RULES:
+1. Remove filler vocalizations ("um", "uh", "er", "ah", "hmm", verbal ticks, and hesitation uses of "like", "you know", "sort of", "I mean").
+2. Fix stutters, false starts, and accidental word or phrase repetitions.
+3. Apply spoken self-corrections seamlessly (e.g., if the speaker says "let's ship Tuesday, wait no, actually Thursday" or "scratch that" / "ignore that", output only the corrected intent rather than transcribing the correction command).
+4. Add clean punctuation, capitalization, and natural sentence/paragraph breaks so the text reads effortlessly.
+5. Do NOT summarize away details, do NOT invent facts, do NOT add headings, bullet lists, [[WikiLinks]], emojis, quotes, or conversational preambles (such as "Here is the cleaned transcript:").
+6. Return ONLY the cleaned prose text itself. If the input contains no meaningful speech, return an empty string.
+        """.trimIndent()
+    }
+
+    fun buildRamblerUserPrompt(rawTranscript: String, priorContextTail: String? = null): String {
+        val cleanRaw = rawTranscript.trim()
+        val cleanTail = priorContextTail?.trim()?.takeLast(240).orEmpty()
+        return if (cleanTail.isNotEmpty()) {
+            """
+### PREVIOUSLY CLEANED CONTEXT (DO NOT REPEAT THIS — use only for sentence continuity and deduplicating boundary overlap):
+\"\"\"
+$cleanTail
+\"\"\"
+
+### NEW RAW TRANSCRIPT SEGMENT TO CLEAN:
+\"\"\"
+$cleanRaw
+\"\"\"
+            """.trimIndent()
+        } else {
+            """
+### RAW TRANSCRIPT TO CLEAN:
+\"\"\"
+$cleanRaw
+\"\"\"
+            """.trimIndent()
+        }
+    }
+
+    fun buildRamblerRequestPayload(rawTranscript: String, priorContextTail: String? = null): String {
+        val systemInstruction = JSONObject().put(
+            "parts",
+            JSONArray().put(JSONObject().put("text", buildRamblerSystemPrompt()))
+        )
+        val userMessage = JSONObject()
+            .put("role", "user")
+            .put(
+                "parts",
+                JSONArray().put(JSONObject().put("text", buildRamblerUserPrompt(rawTranscript, priorContextTail)))
+            )
+        return JSONObject()
+            .put("system_instruction", systemInstruction)
+            .put("contents", JSONArray().put(userMessage))
+            .put("generationConfig", JSONObject().put("temperature", 0.15))
+            .toString()
+    }
+
+    /**
+     * Step 2 of Batch Rambler Mode: passes raw literal speech text from `gemini-3.5-transcribe`
+     * into the configured Flash model with a targeted Rambler system_instruction prompt.
+     */
+    suspend fun cleanTranscriptRamblerStyle(
+        apiKey: String,
+        flashModelId: String = "gemini-3.5-flash",
+        rawTranscript: String,
+        priorContextTail: String? = null
+    ): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanKey = apiKey.trim()
+            require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
+            val trimmedInput = rawTranscript.trim()
+            if (trimmedInput.isEmpty()) return@runCatching ""
+
+            val cleanModel = flashModelId.trim().ifBlank { "gemini-3.5-flash" }
+            val endpointUrl = "$BASE_URL/v1beta/models/$cleanModel:generateContent"
+            val payloadStr = buildRamblerRequestPayload(trimmedInput, priorContextTail)
+
+            var lastFailure: Exception? = null
+            repeat(2) { attemptIdx ->
+                val request = Request.Builder()
+                    .url(endpointUrl)
+                    .header("x-goog-api-key", cleanKey)
+                    .post(payloadStr.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+
+                try {
+                    client.newCall(request).execute().use { response ->
+                        val bodyStr = response.body?.string().orEmpty()
+                        if (!response.isSuccessful) {
+                            val details = parseGeminiErrorDetails(response.code, cleanModel, bodyStr)
+                            val ex = GeminiApiException(
+                                message = "Rambler cleanup error — $details",
+                                debugDetails = "POST $endpointUrl\nHTTP ${response.code} ${response.message}\n${bodyStr.take(2500)}"
+                            )
+                            if (response.code in TRANSIENT_HTTP_CODES && attemptIdx == 0) {
+                                lastFailure = ex
+                                return@use
+                            }
+                            throw ex
+                        }
+
+                        val json = JSONObject(bodyStr)
+                        val candidates = json.optJSONArray("candidates")
+                        if (candidates == null || candidates.length() == 0) {
+                            return@runCatching trimmedInput
+                        }
+                        val parts = candidates.getJSONObject(0)
+                            .optJSONObject("content")
+                            ?.optJSONArray("parts")
+                            ?: return@runCatching trimmedInput
+
+                        val cleaned = buildString {
+                            for (i in 0 until parts.length()) {
+                                append(parts.getJSONObject(i).optString("text", ""))
+                            }
+                        }.let { cleanFences(it) }
+
+                        return@runCatching cleaned.ifBlank { trimmedInput }
+                    }
+                } catch (ioe: IOException) {
+                    if (attemptIdx == 0) {
+                        lastFailure = ioe
+                    } else {
+                        throw ioe
+                    }
+                }
+
+                if (attemptIdx == 0) {
+                    delay(1_500L)
+                }
+            }
+            throw (lastFailure ?: IOException("Rambler cleanup failed."))
+        }
+    }
+
     suspend fun processAudioToDmnMarkdown(
         apiKey: String,
         modelId: String,
