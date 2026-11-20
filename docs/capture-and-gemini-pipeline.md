@@ -4,58 +4,60 @@ This document explains how Synapse DMN captures raw thoughts (both spoken audio 
 
 ---
 
-## 1. Segmented Voice Recording (`DmnAudioRecorder`)
+## 1. Live-First Speech-to-Transcription Studio (`LiveTranscriptionSessionManager` & `PcmAudioEncoder`)
 
-Voice journaling is engineered for long, interrupted sessions while producing a single unified `.m4a` file.
+Voice journaling uses a **Live-first → Batched-fallback** architecture built on durable `AudioRecord` 16kHz mono 16-bit PCM recording (`filesDir/voice_drafts/<draftId>/session.pcm`):
 
-### Microphone Release During Pause
-On Android 12+, simply calling `MediaRecorder.pause()` leaves the OS microphone indicator active in the status bar and keeps hardware mic access locked for the entire pause duration. To solve this:
-
-1. **Recording (`RECORDING`):** `DmnAudioRecorder` writes an AAC-LC MPEG-4 stream (`44,100 Hz`, mono, `128,000 bps`) to a segment file (`dmn_rec_seg_0_<ts>.m4a`) in `cacheDir` and polls `recorder.maxAmplitude` every `80ms` for the live waveform visualizer.
-2. **Pausing (`PAUSED` — `"Paused • Mic Off"`):** Calling `pauseRecording()` stops and **completely releases** `MediaRecorder` (`recorder = null`), finalizing the current segment file and immediately extinguishing Android's microphone-in-use indicator. Accumulated elapsed time is preserved.
-3. **Resuming (`RECORDING`):** Calling `resumeRecording()` opens a new `MediaRecorder` segment (`dmn_rec_seg_1_<ts>.m4a`) with identical audio encoding parameters. If another app or phone call temporarily holds the mic, the failure is surfaced via a snackbar while keeping `PAUSED` state and all earlier segments intact.
-4. **Saving (`stopRecording()`):** Runs on `Dispatchers.IO`:
-   - If only 1 segment exists, it is renamed/used directly.
-   - If multiple segments exist across pauses, `mergeM4aSegments()` losslessly remuxes all segments into a single `.m4a` container (`active_dmn_recording.m4a`) using `MediaExtractor` + `MediaMuxer` with `computeNextPtsOffsetUs()` and `ensureMonotonicPtsUs()` so presentation timestamps (`PTS`) remain strictly monotonic across pause boundaries without audio re-encoding.
-   - The unified `.m4a` is written into `00_Audio_Inbox/` (`<Label>_yyyyMMdd_HHmmss.m4a`), and temporary segment cache files are cleaned up.
+1. **Live Streaming First (`gemini-3.5-transcribe-live`):** Opens a bidirectional WebSocket (`BidiGenerateContent`) via `GeminiLiveTranscribeClient` and streams raw 16kHz PCM chunks in real time while continuously recording every sample to durable internal storage.
+2. **Automatic Batched Fallback (`gemini-3.5-transcribe`):** If the Live model returns high-demand (`429`/`503`), rate-limit, quota, `goAway`, or connection errors, recording continues uninterrupted and the session seamlessly switches to progressive batched transcription (~12s chunks or 6s + silence splits via inline WAV `generateContent` calls) so the user still sees near-live transcription progress.
+3. **Microphone Release During Pause (`Paused • Mic Off`):** Pausing stops and completely releases `AudioRecord`, extinguishing Android's active microphone indicator, closes the Live WebSocket cleanly, and flushes any trailing audio through `gemini-3.5-transcribe`. Resuming or tapping **Continue Recording** later (even after restarting the app) appends smoothly to the same draft.
+4. **Zero-Loss Voice Audio Backup & Automatic Cleanup:**
+   - While recording OR whenever any speech remains untranscribed (e.g., offline mode, network drop, or temporary API outage), `session.pcm` is safely persisted on device alongside exact `transcribedByteOffset` tracking in Room (`voice_drafts`). Reopening the app restores the draft with a **Voice Backup Safe** banner and **Transcribe** catch-up button.
+   - Once 100% of recorded audio is transcribed and the transcript is durably saved in Room, the temporary `session.pcm` audio file is automatically deleted — voice recordings are not unnecessarily duplicated into `99_Audio_Archive/`.
+5. **Durable Editable Drafts + Explicit Confirmation Before Flash Synthesis:**
+   - Stopping a recording saves the draft for review and **never** auto-triggers Flash DMN processing.
+   - Users can close and reopen the app, edit the transcript, switch between multiple saved drafts, or continue recording more speech into a draft.
+   - Only after explicit confirmation (**Confirm & Send to Flash**) is the transcript saved to `04_Text_Inbox/` (`Voice_*.md`) and sent to the Flash DMN Graph model.
 
 ---
 
 ## 2. Direct Text Note Input (`StudioScreen` + `04_Text_Inbox`)
 
-Users who transcribe elsewhere or type quick brain-dumps can switch the Studio hero card to **Text Note** mode:
+Users who transcribe elsewhere or type quick brain-dumps can switch the Studio hero card to **Text / Transcript** mode:
 - Enter or paste text via the clipboard paste action, optional title stem, and target format (`.md` or `.txt`).
 - **Save to Queue:** Writes the file into `04_Text_Inbox/` for later batch synthesis.
 - **Synthesize Now:** Saves into `04_Text_Inbox/` and immediately triggers `DmnProcessWorker` if online (or queues it until connectivity returns).
 
 ---
 
-## 3. Gemini Processing Pipeline (`GeminiDmnService` & `DmnPipelineOrchestrator`)
+## 3. Two-Stage Gemini Processing Pipeline (`GeminiDmnService` & `DmnPipelineOrchestrator`)
 
-All inbox processing runs sequentially inside `DmnPipelineOrchestrator.processMutex`.
+All inbox processing runs sequentially inside `DmnPipelineOrchestrator.processMutex`, splitting speech-to-text from graph synthesis:
 
 ### Step-by-Step Execution
-- **For Audio Files (`00_Audio_Inbox/`):**
-  1. **`upload_audio` (Gemini Files Resumable Upload):** Starts a resumable upload session (`POST https://generativelanguage.googleapis.com/upload/v1beta/files`) and streams bytes from the SAF `Uri` via `PUT uploadUrl` (`UPLOAD, FINALIZE`).
-  2. **`wait_active` (Remote Indexing):** Polls `GET https://generativelanguage.googleapis.com/v1beta/files/{name}` every `2s` until file `state == "ACTIVE"` (fails immediately on `"FAILED"`).
-  3. **`generate_dmn` (Audio Transcription + DMN Synthesis):** Calls `POST https://generativelanguage.googleapis.com/v1beta/models/{modelId}:generateContent` with the active `file_data` URI and the DMN prompt injected with existing vault node names (`[[Node]]`) and current session timestamp.
-  4. **`cleanup_remote`:** Best-effort `DELETE` of the temporary Gemini Files API upload once synthesis succeeds.
-  5. **`save_vault`:** Archives audio (`99_Audio_Archive/`), saves the raw transcript (`98_Transcript_Archive/<stem>.md`), appends the formatted DMN session to `01_Daily_Notes/YYYY-MM-DD.md`, records a `ProcessingJobEntity` (`COMPLETED`), and inserts a detailed `GEMINI` log entry.
+- **For Confirmed Voice Drafts (`StudioScreen` → `04_Text_Inbox/Voice_*.md`):**
+  1. Already transcribed via `gemini-3.5-transcribe-live` and/or batched `gemini-3.5-transcribe` and reviewed by the user.
+  2. **`generate` (Flash DMN Graph Synthesis):** Calls `POST https://generativelanguage.googleapis.com/v1beta/models/{flashModelId}:generateContent` with `buildVoiceTranscriptToDmnPrompt(...)` (default `gemini-3.5-flash`).
+  3. **`save_vault`:** Archives the exact transcript into `98_Transcript_Archive/<stem>.md`, appends the structured DMN session to `01_Daily_Notes/YYYY-MM-DD.md`, and deletes the inbox copy (no voice audio archived).
 
-- **For Text Files (`04_Text_Inbox/`):**
-  - Skips Steps 1, 2, and 4 and proceeds straight from reading the raw text through `generate_dmn` → `save_vault`, archiving the original note into `98_Transcript_Archive/<stem>.md` and deleting the inbox copy.
+- **For External Audio Files Dropped into `00_Audio_Inbox/`:**
+  1. **`upload_start` / `upload_bytes` (Gemini Files Resumable Upload):** Streams bytes to `POST /upload/v1beta/files`.
+  2. **`file_active` (Remote Indexing):** Polls `GET /v1beta/files/{name}` every `2s` until `state == "ACTIVE"`.
+  3. **`transcribe` (Stage 1 — Dedicated Speech-to-Text):** Calls `POST /v1beta/models/{transcriptionModel}:generateContent` (default `gemini-3.5-transcribe`) with `file_data` only.
+  4. **`cleanup_remote`:** Immediately `DELETE`s the temporary Gemini Files API upload right after transcription.
+  5. **`generate` (Stage 2 — Flash DMN Graph Synthesis):** Calls `POST /v1beta/models/{flashModelId}:generateContent` (default `gemini-3.5-flash`) with `buildVoiceTranscriptToDmnPrompt(transcript, existingNodes, timestampStr)`.
+  6. **`save_vault`:** Writes `98_Transcript_Archive/<stem>.md` and `01_Daily_Notes/YYYY-MM-DD.md`, and only after both writes succeed, deletes the temporary source audio from `00_Audio_Inbox/`.
+
+- **For Pasted/Typed Text Files (`04_Text_Inbox/`):**
+  - Runs `generate` using `buildTextDmnPrompt(...)` → `save_vault`, archiving into `98_Transcript_Archive/<stem>.md`.
 
 ---
 
 ## 4. Prompt Design & Rambler-Clean Output
 
 - **Vault Context Injection:** Up to `500` existing Daily Note and Atomic Note titles are passed to Gemini as `[[WikiLinks]]` (`$nodesContext`), allowing new sessions to automatically connect to existing concepts in your Obsidian graph.
-- **Audio Dual-Output Format:** Audio requests instruct Gemini to return two delimited blocks (`parseAudioDualOutput`):
-  - `<RAW_TRANSCRIPT>...</RAW_TRANSCRIPT>` — Clean Rambler-grade verbatim transcript archived as a `.md` file in `98_Transcript_Archive/`.
-  - `<DMN_MARKDOWN>...</DMN_MARKDOWN>` — Structured DMN session note appended to `01_Daily_Notes/YYYY-MM-DD.md`.
-- **Rambler-Style Cleanup:** Both `<RAW_TRANSCRIPT>` and `### Stream of Consciousness (Cleaned)` explicitly instruct Gemini to strip filler sounds (`"um"`, `"uh"`, `"er"`, `"like"`, `"you know"`), stutters, false starts, accidental repetitions, and spoken meta-instructions while preserving full reasoning and nuance.
-- **Professional Formatting (Zero Emojis):** Prompts explicitly forbid decorative emojis anywhere in the output.
-- **Request Payload Shape:** Requests hit `POST https://generativelanguage.googleapis.com/v1beta/models/{modelId}:generateContent` with `generationConfig.temperature = 0.2`. Audio requests attach `contents[0].parts[0].file_data` (`mime_type` + `file_uri`) followed by `parts[1].text`; text requests send `contents[0].parts[0].text`.
+- **Dedicated Transcription + Flash Graph Prompt (`buildVoiceTranscriptToDmnPrompt`):** Takes the raw speech transcript produced by `gemini-3.5-transcribe` / `gemini-3.5-transcribe-live` and produces a Rambler-cleaned first-person `### Stream of Consciousness (Cleaned)` section with inline `[[WikiLinks]]` plus the 4-part `### DMN Synthesis & Graph Connections` section (`## DMN Session — $timestampStr`) with strictly zero emojis.
+- **Request Payload Shape:** Requests hit `POST https://generativelanguage.googleapis.com/v1beta/models/{modelId}:generateContent` with `generationConfig.temperature = 0.2`. Transcription calls send pure audio (`inlineData` WAV for batches or `file_data` for inbox audio); Flash graph calls send `contents[0].parts[0].text`.
 
 ### Exact Voice Recording Prompt (`GeminiDmnService.buildDmnPrompt`)
 

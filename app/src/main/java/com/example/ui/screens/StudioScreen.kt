@@ -108,6 +108,7 @@ import androidx.core.content.ContextCompat
 import com.example.audio.RecordingState
 import com.example.data.local.JobStatus
 import com.example.data.local.ProcessingJobEntity
+import com.example.data.local.VoiceDraftEntity
 import com.example.data.pipeline.ActiveProcessingProgress
 import com.example.data.pipeline.StepStatus
 import com.example.data.vault.InboxAudioFile
@@ -131,8 +132,15 @@ fun StudioScreen(
     onStartRecording: (String) -> Unit,
     onPauseRecording: () -> Unit,
     onResumeRecording: () -> Unit,
-    onStopAndSaveRecording: () -> Unit,
-    onDiscardRecording: () -> Unit,
+    onStopRecordingForReview: () -> Unit,
+    onRetryLiveTranscription: () -> Unit,
+    onUpdateDraftTitle: (String) -> Unit,
+    onUpdateDraftTranscript: (String) -> Unit,
+    onSelectDraft: (VoiceDraftEntity) -> Unit,
+    onNewDraft: () -> Unit,
+    onDeleteDraft: (String) -> Unit,
+    onTranscribePendingAudio: () -> Unit,
+    onConfirmSendDraftToDmn: (Boolean) -> Unit,
     onSubmitTextNote: (rawText: String, title: String, extension: String, processImmediately: Boolean) -> Unit,
     onProcessAllNow: () -> Unit,
     onProcessSingle: (String) -> Unit,
@@ -160,12 +168,13 @@ fun StudioScreen(
     }
 
     var captureMode by rememberSaveable { mutableStateOf(StudioCaptureMode.VOICE) }
-    var sessionLabel by remember { mutableStateOf("DMN") }
     var textTitle by rememberSaveable { mutableStateOf("") }
     var textBody by rememberSaveable { mutableStateOf("") }
     var textExtension by rememberSaveable { mutableStateOf("md") }
     var permissionDeniedNotice by remember { mutableStateOf(false) }
     var jobPendingDelete by remember { mutableStateOf<ProcessingJobEntity?>(null) }
+    var draftIdPendingDelete by remember { mutableStateOf<String?>(null) }
+    var showConfirmSendDraftDialog by remember { mutableStateOf(false) }
     var showProgressDialog by remember { mutableStateOf(false) }
     var pendingNotificationAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
@@ -174,7 +183,7 @@ fun StudioScreen(
     ) { granted ->
         if (granted) {
             permissionDeniedNotice = false
-            onStartRecording(sessionLabel)
+            onStartRecording(state.liveSession.draftTitle)
         } else {
             permissionDeniedNotice = true
         }
@@ -282,29 +291,38 @@ fun StudioScreen(
 
         item {
             if (captureMode == StudioCaptureMode.VOICE) {
-                VoiceRecorderHeroCard(
-                    recordingState = state.recordingState,
-                    elapsedMs = state.recordingElapsedMs,
-                    amplitudes = state.recordingAmplitudes,
-                    sessionLabel = sessionLabel,
-                    onSessionLabelChange = { sessionLabel = it },
+                VoiceTranscriptionStudioCard(
+                    liveSession = state.liveSession,
+                    liveModelName = state.settings.liveTranscriptionModel,
+                    transcribeModelName = state.settings.transcriptionModel,
+                    flashModelName = state.settings.geminiModel,
                     vaultConfigured = state.settings.isVaultConfigured,
+                    geminiConfigured = state.settings.isGeminiConfigured,
                     permissionDeniedNotice = permissionDeniedNotice,
-                    onRecordTap = {
+                    onRecordOrContinueTap = {
                         val hasMic = ContextCompat.checkSelfPermission(
                             context,
                             Manifest.permission.RECORD_AUDIO
                         ) == PackageManager.PERMISSION_GRANTED
                         if (hasMic) {
-                            onStartRecording(sessionLabel)
+                            onStartRecording(state.liveSession.draftTitle)
                         } else {
                             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         }
                     },
                     onPause = onPauseRecording,
                     onResume = onResumeRecording,
-                    onStopAndSave = onStopAndSaveRecording,
-                    onDiscard = onDiscardRecording
+                    onStopForReview = onStopRecordingForReview,
+                    onRetryLive = onRetryLiveTranscription,
+                    onTitleChange = onUpdateDraftTitle,
+                    onTranscriptChange = onUpdateDraftTranscript,
+                    onTranscribePending = onTranscribePendingAudio,
+                    onRequestConfirmSend = { showConfirmSendDraftDialog = true },
+                    onNewDraft = onNewDraft,
+                    onRequestDeleteActiveDraft = {
+                        state.liveSession.activeDraftId?.let { draftIdPendingDelete = it }
+                            ?: onNewDraft()
+                    }
                 )
             } else {
                 TextNoteComposerCard(
@@ -332,6 +350,32 @@ fun StudioScreen(
                             onSubmitTextNote(capturedBody, capturedTitle, capturedExt, true)
                         }
                     }
+                )
+            }
+        }
+
+        if (captureMode == StudioCaptureMode.VOICE && state.voiceDrafts.isNotEmpty()) {
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "Saved Transcription Drafts (${state.voiceDrafts.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                    Text(
+                        text = "Persisted across app restarts. Tap to review, edit, continue recording, or confirm for DMN Graph.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            items(state.voiceDrafts, key = { "draft_${it.id}" }) { draft ->
+                SavedVoiceDraftRow(
+                    draft = draft,
+                    isActive = state.liveSession.activeDraftId == draft.id,
+                    enabled = state.recordingState == RecordingState.IDLE,
+                    onSelect = { onSelectDraft(draft) },
+                    onDelete = { draftIdPendingDelete = draft.id }
                 )
             }
         }
@@ -581,205 +625,52 @@ fun StudioScreen(
             }
         )
     }
-}
-
-@Composable
-private fun VoiceRecorderHeroCard(
-    recordingState: RecordingState,
-    elapsedMs: Long,
-    amplitudes: List<Float>,
-    sessionLabel: String,
-    onSessionLabelChange: (String) -> Unit,
-    vaultConfigured: Boolean,
-    permissionDeniedNotice: Boolean,
-    onRecordTap: () -> Unit,
-    onPause: () -> Unit,
-    onResume: () -> Unit,
-    onStopAndSave: () -> Unit,
-    onDiscard: () -> Unit
-) {
-    val sem = LocalSynapseColors.current
-    val infinite = rememberInfiniteTransition(label = "rec_pulse")
-    val pulseAlpha by infinite.animateFloat(
-        initialValue = 0.25f,
-        targetValue = 0.7f,
-        animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
-        label = "pulse_alpha"
-    )
-
-    val activeBorder = when (recordingState) {
-        RecordingState.RECORDING -> sem.recordingCrimson.copy(alpha = pulseAlpha)
-        RecordingState.PAUSED -> sem.amber.copy(alpha = 0.6f)
-        RecordingState.IDLE -> sem.cardBorder
+    if (showConfirmSendDraftDialog) {
+        ConfirmSendDraftDialog(
+            liveSession = state.liveSession,
+            flashModelName = state.settings.geminiModel,
+            transcribeModelName = state.settings.transcriptionModel,
+            onConfirmSend = { transcribePendingFirst ->
+                showConfirmSendDraftDialog = false
+                runWithBackgroundNotificationConsent {
+                    onConfirmSendDraftToDmn(transcribePendingFirst)
+                }
+            },
+            onDismiss = { showConfirmSendDraftDialog = false }
+        )
     }
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.extraLarge,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-        border = BorderStroke(1.5.dp, activeBorder)
-    ) {
-        Column(
-            modifier = Modifier.padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    StatusPill(
-                        label = when (recordingState) {
-                            RecordingState.IDLE -> "Unbounded • Offline Ready"
-                            RecordingState.RECORDING -> "Recording Live"
-                            RecordingState.PAUSED -> "Paused • Mic Off"
-                        },
-                        color = when (recordingState) {
-                            RecordingState.IDLE -> sem.amber
-                            RecordingState.RECORDING -> sem.recordingCrimson
-                            RecordingState.PAUSED -> sem.amber
-                        },
-                        containerColor = when (recordingState) {
-                            RecordingState.IDLE -> sem.amberContainer
-                            RecordingState.RECORDING -> sem.recordingCrimsonContainer
-                            RecordingState.PAUSED -> sem.amberContainer
-                        }
-                    )
-                    Text(
-                        text = "Screen Always On",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.testTag("screen_awake_label")
-                    )
-                }
+    draftIdPendingDelete?.let { targetDraftId ->
+        val matching = state.voiceDrafts.firstOrNull { it.id == targetDraftId }
+        AlertDialog(
+            onDismissRequest = { draftIdPendingDelete = null },
+            title = { Text("Delete Saved Voice Draft?") },
+            text = {
                 Text(
-                    text = formatDurationMs(elapsedMs),
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.onSurface
+                    "This will permanently delete \"${matching?.title ?: "Voice Draft"}\" and any stored pending audio backup."
                 )
-            }
-
-            // Live acoustic waveform Canvas
-            val barActiveColor = if (recordingState == RecordingState.RECORDING) {
-                sem.amber
-            } else {
-                MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
-            }
-            val barTrackColor = MaterialTheme.colorScheme.surfaceContainerHighest
-
-            Canvas(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(58.dp)
-                    .clip(MaterialTheme.shapes.medium)
-                    .background(MaterialTheme.colorScheme.surfaceContainerLowest.copy(alpha = 0.65f))
-                    .padding(horizontal = 10.dp, vertical = 8.dp)
-            ) {
-                val count = amplitudes.size.coerceAtLeast(1)
-                val step = size.width / count
-                val barWidth = (step * 0.58f).coerceAtLeast(3f)
-                val centerY = size.height / 2f
-
-                amplitudes.forEachIndexed { idx, amp ->
-                    val barHeight = (amp * size.height).coerceIn(6f, size.height)
-                    val x = idx * step + (step - barWidth) / 2f
-                    drawRoundRect(
-                        color = if (amp > 0.1f) barActiveColor else barTrackColor,
-                        topLeft = Offset(x, centerY - barHeight / 2f),
-                        size = Size(barWidth, barHeight),
-                        cornerRadius = CornerRadius(barWidth / 2f, barWidth / 2f)
-                    )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        draftIdPendingDelete = null
+                        onDeleteDraft(targetDraftId)
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("confirm_delete_draft_button")
+                ) {
+                    Text("Delete Draft")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { draftIdPendingDelete = null }) {
+                    Text("Cancel")
                 }
             }
-
-            if (recordingState == RecordingState.IDLE) {
-                OutlinedTextField(
-                    value = sessionLabel,
-                    onValueChange = onSessionLabelChange,
-                    label = { Text("Session Prefix (optional)") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("session_label_input")
-                )
-            }
-
-            if (permissionDeniedNotice) {
-                Text(
-                    text = "Microphone permission is required to record in-app. You can also drop recordings via Obsidian into 00_Audio_Inbox/.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (recordingState == RecordingState.IDLE) {
-                    Button(
-                        onClick = onRecordTap,
-                        enabled = vaultConfigured,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(52.dp)
-                            .testTag("start_recording_button"),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary
-                        )
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.FiberManualRecord,
-                            contentDescription = "Record",
-                            tint = sem.amber,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (vaultConfigured) "Start DMN Session" else "Select Vault First",
-                            style = MaterialTheme.typography.titleSmall
-                        )
-                    }
-                } else {
-                    OutlinedButton(
-                        onClick = onDiscard,
-                        modifier = Modifier
-                            .height(52.dp)
-                            .testTag("discard_recording_button")
-                    ) {
-                        Icon(Icons.Outlined.DeleteOutline, contentDescription = "Discard")
-                    }
-                    FilledTonalButton(
-                        onClick = if (recordingState == RecordingState.RECORDING) onPause else onResume,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(52.dp)
-                            .testTag("pause_resume_recording_button")
-                    ) {
-                        Icon(
-                            imageVector = if (recordingState == RecordingState.RECORDING) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = null
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(if (recordingState == RecordingState.RECORDING) "Pause" else "Resume")
-                    }
-                    Button(
-                        onClick = onStopAndSave,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(52.dp)
-                            .testTag("stop_save_recording_button"),
-                        colors = ButtonDefaults.buttonColors(containerColor = sem.emerald)
-                    ) {
-                        Icon(Icons.Filled.Stop, contentDescription = null, tint = Color(0xFF062116))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Save & Queue", color = Color(0xFF062116), fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
+        )
     }
 }
 

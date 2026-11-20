@@ -3,6 +3,7 @@ package com.example
 import android.app.Application
 import com.example.audio.DmnAudioPlayer
 import com.example.audio.DmnAudioRecorder
+import com.example.audio.LiveTranscriptionSessionManager
 import com.example.data.drive.GoogleDriveAuthManager
 import com.example.data.drive.GoogleDriveSyncService
 import com.example.data.gemini.GeminiDmnService
@@ -38,5 +39,12 @@ class SynapseApplication : Application() {
         )
     }
     val audioRecorder: DmnAudioRecorder by lazy { DmnAudioRecorder(this) }
+    val liveTranscriptionManager: LiveTranscriptionSessionManager by lazy {
+        LiveTranscriptionSessionManager(
+            context = this,
+            geminiService = geminiService,
+            draftDao = database.voiceDraftDao()
+        )
+    }
     val audioPlayer: DmnAudioPlayer by lazy { DmnAudioPlayer(this) }
 }

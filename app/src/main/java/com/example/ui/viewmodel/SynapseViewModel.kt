@@ -9,11 +9,13 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.SynapseApplication
 import com.example.audio.AudioPlaybackState
+import com.example.audio.LiveStudioSessionState
 import com.example.audio.RecordingState
 import com.example.data.drive.DriveAuthOutcome
 import com.example.data.drive.DriveFolderItem
 import com.example.data.local.ProcessingJobEntity
 import com.example.data.local.SyncLogEntity
+import com.example.data.local.VoiceDraftEntity
 import com.example.data.pipeline.ActiveProcessingProgress
 import com.example.data.prefs.ConflictStrategy
 import com.example.data.prefs.SyncDirection
@@ -24,6 +26,7 @@ import com.example.data.vault.InboxAudioFile
 import com.example.data.vault.InboxTextFile
 import com.example.data.vault.KnowledgeGraphData
 import com.example.data.vault.VaultNote
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -53,6 +56,8 @@ data class MainUiState(
     val recordingState: RecordingState = RecordingState.IDLE,
     val recordingElapsedMs: Long = 0L,
     val recordingAmplitudes: List<Float> = List(36) { 0.08f },
+    val liveSession: LiveStudioSessionState = LiveStudioSessionState(),
+    val voiceDrafts: List<VoiceDraftEntity> = emptyList(),
     val playbackState: AudioPlaybackState = AudioPlaybackState(),
     val isProcessingAudio: Boolean = false,
     val isSyncingDrive: Boolean = false,
@@ -186,21 +191,20 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
     }
 
     private val mediaFlow = combine(
-        app.audioRecorder.state,
-        app.audioRecorder.elapsedMs,
-        app.audioRecorder.amplitudeHistory,
+        app.liveTranscriptionManager.sessionState,
+        app.database.voiceDraftDao().observeAllDrafts(),
         app.audioPlayer.playbackState
-    ) { recState, elapsed, amps, playState ->
-        listOf(recState, elapsed, amps, playState)
+    ) { liveSession, drafts, playState ->
+        Triple(liveSession, drafts, playState)
     }
 
-    @Suppress("UNCHECKED_CAST")
     val uiState: StateFlow<MainUiState> = combine(
         app.settingsRepo.settingsFlow,
         pipelineFlow,
         mediaFlow,
         auxiliaryFlow
     ) { settings, pipe, media, aux ->
+        val (liveSession, drafts, playState) = media
         MainUiState(
             settings = settings,
             inboxFiles = pipe.inbox,
@@ -210,10 +214,12 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
             jobs = pipe.jobs,
             logs = pipe.logs,
             graphData = pipe.graph,
-            recordingState = media[0] as RecordingState,
-            recordingElapsedMs = media[1] as Long,
-            recordingAmplitudes = media[2] as List<Float>,
-            playbackState = media[3] as AudioPlaybackState,
+            recordingState = liveSession.recordingState,
+            recordingElapsedMs = liveSession.elapsedMs,
+            recordingAmplitudes = liveSession.amplitudes,
+            liveSession = liveSession,
+            voiceDrafts = drafts,
+            playbackState = playState,
             isProcessingAudio = pipe.isProc,
             isSyncingDrive = pipe.isSync,
             liveStatusMessage = pipe.liveMsg,
@@ -235,6 +241,16 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
 
     init {
         refreshAll()
+        // Auto-restore the most recent saved transcription draft on launch
+        viewModelScope.launch {
+            val currentSession = app.liveTranscriptionManager.sessionState.value
+            if (currentSession.activeDraftId == null && currentSession.recordingState == RecordingState.IDLE) {
+                val savedDrafts = app.database.voiceDraftDao().observeAllDrafts().first()
+                savedDrafts.firstOrNull()?.let { latest ->
+                    app.liveTranscriptionManager.loadDraft(latest)
+                }
+            }
+        }
         viewModelScope.launch {
             app.pipelineOrchestrator.completionMessages.collect { msg ->
                 _snackbarMessages.emit(msg)
@@ -268,22 +284,42 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
         }
     }
 
-    fun saveGeminiConfig(apiKey: String, model: String) {
+    fun saveGeminiConfig(
+        apiKey: String,
+        model: String,
+        transcriptionModel: String? = null,
+        liveTranscriptionModel: String? = null
+    ) {
         viewModelScope.launch {
             val cleanModel = model.trim().ifBlank { VaultSettings.DEFAULT_GEMINI_MODEL }
-            app.settingsRepo.setGeminiConfig(apiKey, cleanModel)
+            app.settingsRepo.setGeminiConfig(
+                apiKey = apiKey,
+                model = cleanModel,
+                transcriptionModel = transcriptionModel,
+                liveTranscriptionModel = liveTranscriptionModel
+            )
             _geminiTestState.value = GeminiTestState.Idle
-            _snackbarMessages.emit("Saved Google AI Studio configuration ($cleanModel).")
+            _snackbarMessages.emit("Saved Gemini configuration (Flash: $cleanModel).")
         }
     }
 
-    fun testGeminiConnection(apiKey: String, model: String) {
+    fun testGeminiConnection(
+        apiKey: String,
+        model: String,
+        transcriptionModel: String? = null,
+        liveTranscriptionModel: String? = null
+    ) {
         viewModelScope.launch {
             _geminiTestState.value = GeminiTestState.Testing
             val cleanModel = model.trim().ifBlank { VaultSettings.DEFAULT_GEMINI_MODEL }
             val result = app.geminiService.testApiKey(apiKey, cleanModel)
             result.onSuccess { msg ->
-                app.settingsRepo.setGeminiConfig(apiKey, cleanModel)
+                app.settingsRepo.setGeminiConfig(
+                    apiKey = apiKey,
+                    model = cleanModel,
+                    transcriptionModel = transcriptionModel,
+                    liveTranscriptionModel = liveTranscriptionModel
+                )
                 _geminiTestState.value = GeminiTestState.Success(msg)
                 app.geminiService.fetchAvailableModels(apiKey).onSuccess { models ->
                     if (models.isNotEmpty()) _availableGeminiModels.value = models
@@ -313,56 +349,199 @@ class SynapseViewModel(private val app: SynapseApplication) : ViewModel() {
     }
 
     fun startRecording(sessionLabel: String) {
-        app.audioRecorder.startRecording(viewModelScope, sessionLabel.ifBlank { "DMN" })
-            .onFailure { err ->
-                viewModelScope.launch {
-                    _snackbarMessages.emit("Could not start recorder: ${err.message}")
-                }
-            }
-    }
-
-    fun pauseRecording() = app.audioRecorder.pauseRecording()
-
-    fun resumeRecording() {
-        app.audioRecorder.resumeRecording().onFailure { err ->
-            viewModelScope.launch {
-                _snackbarMessages.emit("Could not resume microphone: ${err.message}. Recorded segments are preserved.")
+        viewModelScope.launch {
+            val settings = app.settingsRepo.currentSettings()
+            app.liveTranscriptionManager.startOrContinueRecording(
+                apiKey = settings.geminiApiKey,
+                liveModelId = settings.liveTranscriptionModel,
+                transcribeModelId = settings.transcriptionModel,
+                requestedTitle = sessionLabel
+            ).onFailure { err ->
+                _snackbarMessages.emit("Could not start recorder: ${err.message}")
             }
         }
     }
 
-    fun discardRecording() {
-        app.audioRecorder.stopAndDiscard()
+    fun pauseRecording() {
+        viewModelScope.launch {
+            app.liveTranscriptionManager.pauseRecording()
+        }
     }
 
-    fun stopAndSaveRecording() {
+    fun resumeRecording() {
         viewModelScope.launch {
             val settings = app.settingsRepo.currentSettings()
-            val recResult = app.audioRecorder.stopRecording()
-            recResult.onSuccess { recorded ->
-                val treeUri = settings.vaultTreeUri
-                if (treeUri.isNullOrBlank()) {
-                    recorded.tempFile.delete()
-                    _snackbarMessages.emit("Select your ObsidianVault folder before saving recordings.")
-                    return@launch
+            app.liveTranscriptionManager.resumeRecording(
+                apiKey = settings.geminiApiKey,
+                liveModelId = settings.liveTranscriptionModel,
+                transcribeModelId = settings.transcriptionModel
+            ).onFailure { err ->
+                _snackbarMessages.emit("Could not resume microphone: ${err.message}. Your saved draft & audio are intact.")
+            }
+        }
+    }
+
+    fun stopRecordingForReview() {
+        viewModelScope.launch {
+            val settings = app.settingsRepo.currentSettings()
+            app.liveTranscriptionManager.stopRecordingForReview(
+                apiKey = settings.geminiApiKey,
+                transcribeModelId = settings.transcriptionModel
+            )
+        }
+    }
+
+    fun retryLiveTranscription() {
+        viewModelScope.launch {
+            val settings = app.settingsRepo.currentSettings()
+            app.liveTranscriptionManager.retryLiveConnectionWhileRecording(
+                apiKey = settings.geminiApiKey,
+                liveModelId = settings.liveTranscriptionModel,
+                transcribeModelId = settings.transcriptionModel
+            )
+        }
+    }
+
+    fun updateActiveDraftTitle(title: String) {
+        app.liveTranscriptionManager.updateDraftTitle(title)
+    }
+
+    fun updateActiveDraftTranscript(text: String) {
+        app.liveTranscriptionManager.updateDraftTranscript(text)
+    }
+
+    fun selectVoiceDraft(draft: VoiceDraftEntity) {
+        viewModelScope.launch {
+            app.liveTranscriptionManager.loadDraft(draft)
+        }
+    }
+
+    fun startNewVoiceDraft() {
+        viewModelScope.launch {
+            app.liveTranscriptionManager.startNewEmptyDraft()
+        }
+    }
+
+    fun deleteVoiceDraft(draftId: String) {
+        viewModelScope.launch {
+            app.liveTranscriptionManager.deleteDraft(draftId)
+            val remaining = app.database.voiceDraftDao().observeAllDrafts().first()
+            remaining.firstOrNull()?.let { nextDraft ->
+                if (app.liveTranscriptionManager.sessionState.value.activeDraftId == null) {
+                    app.liveTranscriptionManager.loadDraft(nextDraft)
                 }
-                val saved = app.vaultRepo.saveCachedAudioToInbox(
-                    treeUriString = treeUri,
-                    tempFile = recorded.tempFile,
-                    desiredFileName = recorded.suggestedFileName
-                )
-                recorded.tempFile.delete()
-                saved.onSuccess { audio ->
-                    app.pipelineOrchestrator.refreshVaultAndInbox()
-                    _snackbarMessages.emit("Saved ${audio.name} to 00_Audio_Inbox.")
-                    if (settings.autoProcessAudio && settings.isGeminiConfigured) {
-                        app.pipelineOrchestrator.enqueueBackgroundProcessing(triggerImmediateIfOnline = true)
-                    }
-                }.onFailure { err ->
-                    _snackbarMessages.emit("Failed saving to 00_Audio_Inbox: ${err.message}")
+            }
+            _snackbarMessages.emit("Deleted saved voice draft.")
+        }
+    }
+
+    fun transcribePendingDraftAudio() {
+        viewModelScope.launch {
+            val settings = app.settingsRepo.currentSettings()
+            val res = app.liveTranscriptionManager.transcribeRemainingForActiveDraft(
+                apiKey = settings.geminiApiKey,
+                transcribeModelId = settings.transcriptionModel
+            )
+            res.onSuccess { chunks ->
+                if (chunks > 0) {
+                    _snackbarMessages.emit("Transcribed pending audio ($chunks batch(es)). Temp voice audio cleared once safe.")
+                } else {
+                    _snackbarMessages.emit("All recorded audio in this draft is already transcribed.")
                 }
             }.onFailure { err ->
-                _snackbarMessages.emit("Recording error: ${err.message}")
+                _snackbarMessages.emit("Audio kept safely on device: ${err.message}")
+            }
+        }
+    }
+
+    /**
+     * Explicit user confirmation to send the reviewed voice transcript to Flash DMN Graph synthesis.
+     * Saves only the confirmed transcript (NOT the voice audio archive) into `04_Text_Inbox/` and
+     * immediately triggers Flash DMN synthesis.
+     */
+    fun confirmAndSendDraftToDmn(transcribePendingFirst: Boolean = true) {
+        viewModelScope.launch {
+            val settings = app.settingsRepo.currentSettings()
+            val treeUri = settings.vaultTreeUri
+            if (treeUri.isNullOrBlank()) {
+                _snackbarMessages.emit("Select your ObsidianVault folder before sending to DMN Graph.")
+                return@launch
+            }
+            if (!settings.isGeminiConfigured) {
+                _snackbarMessages.emit("Add your Google AI Studio API key in Sync first.")
+                return@launch
+            }
+
+            app.liveTranscriptionManager.setSubmittingForDmn(true)
+            try {
+                // Ensure recording is stopped first if still paused
+                if (app.liveTranscriptionManager.sessionState.value.recordingState != RecordingState.IDLE) {
+                    app.liveTranscriptionManager.stopRecordingForReview(
+                        apiKey = settings.geminiApiKey,
+                        transcribeModelId = settings.transcriptionModel
+                    )
+                }
+
+                // If any untranscribed audio remains and user opted to transcribe it first, finish it safely
+                val currentSession = app.liveTranscriptionManager.sessionState.value
+                if (transcribePendingFirst && currentSession.untranscribedBytes > 0L) {
+                    val catchUp = app.liveTranscriptionManager.transcribeRemainingForActiveDraft(
+                        apiKey = settings.geminiApiKey,
+                        transcribeModelId = settings.transcriptionModel
+                    )
+                    if (catchUp.isFailure) {
+                        _snackbarMessages.emit(
+                            "Could not finish pending transcription yet — draft & voice audio kept safely on device: ${catchUp.exceptionOrNull()?.message}"
+                        )
+                        return@launch
+                    }
+                }
+
+                val readySession = app.liveTranscriptionManager.sessionState.value
+                val finalTranscript = readySession.confirmedTranscript.trim()
+                if (finalTranscript.isBlank()) {
+                    _snackbarMessages.emit("Transcript is empty. Record or type thoughts before confirming.")
+                    return@launch
+                }
+
+                val cleanTitle = readySession.draftTitle.trim()
+                    .replace(Regex("""[^A-Za-z0-9_\-\s]"""), "")
+                    .trim()
+                    .replace(Regex("""\s+"""), "_")
+                    .ifBlank { "Session" }
+                val voiceTitle = if (cleanTitle.startsWith("Voice_", ignoreCase = true)) {
+                    cleanTitle
+                } else {
+                    "Voice_$cleanTitle"
+                }
+
+                val saved = app.vaultRepo.saveTextToInbox(
+                    treeUriString = treeUri,
+                    rawText = finalTranscript,
+                    sessionTitle = voiceTitle,
+                    originalExtension = "md"
+                )
+                saved.onSuccess { textItem ->
+                    readySession.activeDraftId?.let { id ->
+                        app.liveTranscriptionManager.deleteDraft(id)
+                    }
+                    // Load next remaining draft if any exist
+                    val remaining = app.database.voiceDraftDao().observeAllDrafts().first()
+                    remaining.firstOrNull()?.let { nextDraft ->
+                        app.liveTranscriptionManager.loadDraft(nextDraft)
+                    }
+
+                    app.pipelineOrchestrator.refreshVaultAndInbox()
+                    app.pipelineOrchestrator.enqueueBackgroundProcessing(
+                        triggerImmediateIfOnline = true,
+                        singleTargetUri = textItem.uri.toString()
+                    )
+                    _snackbarMessages.emit("Confirmed! Sending transcript to ${settings.geminiModel} for DMN Graph synthesis.")
+                }.onFailure { err ->
+                    _snackbarMessages.emit("Failed queuing transcript (draft remains safe): ${err.message}")
+                }
+            } finally {
+                app.liveTranscriptionManager.setSubmittingForDmn(false)
             }
         }
     }

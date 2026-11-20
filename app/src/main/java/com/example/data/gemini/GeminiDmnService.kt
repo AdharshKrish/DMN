@@ -19,6 +19,7 @@ import okio.source
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -105,6 +106,8 @@ class GeminiDmnService(private val context: Context) {
         private const val BASE_URL = "https://generativelanguage.googleapis.com"
         private val WIKILINK_EXTRACT_REGEX = Regex("""(?<!!)\[\[([^\[\]|#]+)(?:#[^\[\]|]+)?(?:\|[^\[\]]+)?]]""")
         private val TRANSIENT_HTTP_CODES = setOf(429, 500, 502, 503, 504)
+        const val DEFAULT_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
+        const val DEFAULT_LIVE_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live"
         const val CONNECT_TIMEOUT_SECONDS = 60L
         const val READ_WRITE_TIMEOUT_SECONDS = 360L // 6 minutes (> 5 min) per request
         const val MAX_RETRY_WINDOW_MS = 300_000L // 5-minute retry window for transient demand/rate spikes
@@ -215,6 +218,72 @@ class GeminiDmnService(private val context: Context) {
         )
     }
 
+    /**
+     * Transcribes an inline WAV audio chunk directly using the dedicated transcription model
+     * (default: gemini-3.5-transcribe). Used for batched fallback & pending audio catch-up.
+     */
+    suspend fun transcribeInlineWavChunk(
+        apiKey: String,
+        transcribeModelId: String = DEFAULT_TRANSCRIBE_MODEL,
+        wavBytes: ByteArray
+    ): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanKey = apiKey.trim()
+            require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
+            require(wavBytes.size > 44) { "Audio chunk is empty." }
+
+            val cleanModel = transcribeModelId.trim().ifBlank { DEFAULT_TRANSCRIBE_MODEL }
+            val endpointUrl = "$BASE_URL/v1beta/models/$cleanModel:generateContent"
+            val audioBase64 = Base64.getEncoder().encodeToString(wavBytes)
+
+            val partsArray = JSONArray().put(
+                JSONObject().put(
+                    "inlineData",
+                    JSONObject()
+                        .put("mimeType", "audio/wav")
+                        .put("data", audioBase64)
+                )
+            )
+            val payload = JSONObject().put(
+                "contents",
+                JSONArray().put(JSONObject().put("parts", partsArray))
+            )
+
+            val request = Request.Builder()
+                .url(endpointUrl)
+                .header("x-goog-api-key", cleanKey)
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    val details = parseGeminiErrorDetails(response.code, cleanModel, bodyStr)
+                    throw GeminiApiException(
+                        message = "Transcription error — $details",
+                        debugDetails = "POST $endpointUrl\nHTTP ${response.code} ${response.message}\n${bodyStr.take(2500)}"
+                    )
+                }
+
+                val json = JSONObject(bodyStr)
+                val candidates = json.optJSONArray("candidates")
+                if (candidates == null || candidates.length() == 0) {
+                    return@use ""
+                }
+                val parts = candidates.getJSONObject(0)
+                    .optJSONObject("content")
+                    ?.optJSONArray("parts")
+                    ?: return@use ""
+
+                buildString {
+                    for (i in 0 until parts.length()) {
+                        append(parts.getJSONObject(i).optString("text", ""))
+                    }
+                }.trim()
+            }
+        }
+    }
+
     suspend fun processAudioToDmnMarkdown(
         apiKey: String,
         modelId: String,
@@ -227,12 +296,44 @@ class GeminiDmnService(private val context: Context) {
         onStageChanged: suspend (stage: String) -> Unit,
         onStatusDetail: (suspend (String) -> Unit)? = null,
         onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null,
-        retryControl: RetryControlChannel? = null
+        retryControl: RetryControlChannel? = null,
+        transcribeModelId: String = DEFAULT_TRANSCRIBE_MODEL,
+        precomputedTranscript: String? = null
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
-        val cleanModel = modelId.trim().ifBlank { "gemini-3.5-flash" }
+        val cleanFlashModel = modelId.trim().ifBlank { "gemini-3.5-flash" }
+        val cleanTranscribeModel = transcribeModelId.trim().ifBlank { DEFAULT_TRANSCRIBE_MODEL }
 
+        if (!precomputedTranscript.isNullOrBlank()) {
+            onStageChanged("SYNTHESIZING")
+            val prompt = buildVoiceTranscriptToDmnPrompt(precomputedTranscript.trim(), existingNodes, timestampStr)
+            val graphOutput = callGenerateContent(
+                apiKey = cleanKey,
+                initialModelId = cleanFlashModel,
+                fileUri = null,
+                mimeType = null,
+                prompt = prompt,
+                onStatusDetail = onStatusDetail,
+                onStepUpdate = onStepUpdate,
+                retryControl = retryControl
+            )
+            val cleanedMarkdown = cleanFences(graphOutput.text)
+            val links = WIKILINK_EXTRACT_REGEX.findAll(cleanedMarkdown)
+                .map { it.groupValues[1].trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .toList()
+            return@withContext GeminiGenerationResult(
+                markdown = cleanedMarkdown,
+                rawTranscript = precomputedTranscript.trim(),
+                modelUsed = "Draft -> ${graphOutput.modelUsed}",
+                extractedWikiLinks = links,
+                debugDetails = graphOutput.debugDetails
+            )
+        }
+
+        // Stage 1: Upload audio -> dedicated transcription model (gemini-3.5-transcribe)
         onStageChanged("UPLOADING")
         val uploaded = uploadAudioResumable(
             apiKey = cleanKey,
@@ -243,39 +344,22 @@ class GeminiDmnService(private val context: Context) {
             onStepUpdate = onStepUpdate
         )
 
-        try {
+        val transcribeOutput = try {
             onStageChanged("PROCESSING_REMOTE")
             val activeFile = waitForFileActive(cleanKey, uploaded.name, onStepUpdate)
 
-            onStageChanged("SYNTHESIZING")
-            val prompt = buildDmnPrompt(existingNodes, timestampStr)
-            val callOutput = callGenerateContent(
+            onStageChanged("TRANSCRIBING")
+            callTranscribeFileContent(
                 apiKey = cleanKey,
-                initialModelId = cleanModel,
+                initialTranscribeModelId = cleanTranscribeModel,
                 fileUri = activeFile.uri,
                 mimeType = activeFile.mimeType.ifBlank { mimeType },
-                prompt = prompt,
                 onStatusDetail = onStatusDetail,
                 onStepUpdate = onStepUpdate,
                 retryControl = retryControl
             )
-
-            val (cleanTranscript, markdown) = parseAudioDualOutput(callOutput.text)
-            val links = WIKILINK_EXTRACT_REGEX.findAll(markdown)
-                .map { it.groupValues[1].trim() }
-                .filter { it.isNotBlank() }
-                .distinct()
-                .toList()
-
-            GeminiGenerationResult(
-                markdown = markdown,
-                rawTranscript = cleanTranscript,
-                modelUsed = callOutput.modelUsed,
-                extractedWikiLinks = links,
-                debugDetails = callOutput.debugDetails
-            )
         } finally {
-            // Privacy rule from blueprint: delete temporary audio from Google servers immediately
+            // Privacy rule: delete temporary audio from Google servers right after transcription
             onStepUpdate?.invoke(
                 GeminiStepUpdate(
                     stepId = "cleanup_remote",
@@ -297,6 +381,44 @@ class GeminiDmnService(private val context: Context) {
                 )
             )
         }
+
+        val cleanTranscript = transcribeOutput.text.trim()
+        require(cleanTranscript.isNotBlank()) { "Transcription returned empty text." }
+
+        // Stage 2: Dedicated Flash model for Transcript -> DMN Knowledge Graph Markdown
+        onStageChanged("SYNTHESIZING")
+        val prompt = buildVoiceTranscriptToDmnPrompt(cleanTranscript, existingNodes, timestampStr)
+        val graphOutput = callGenerateContent(
+            apiKey = cleanKey,
+            initialModelId = cleanFlashModel,
+            fileUri = null,
+            mimeType = null,
+            prompt = prompt,
+            onStatusDetail = onStatusDetail,
+            onStepUpdate = onStepUpdate,
+            retryControl = retryControl
+        )
+
+        val cleanedMarkdown = cleanFences(graphOutput.text)
+        val links = WIKILINK_EXTRACT_REGEX.findAll(cleanedMarkdown)
+            .map { it.groupValues[1].trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .toList()
+
+        GeminiGenerationResult(
+            markdown = cleanedMarkdown,
+            rawTranscript = cleanTranscript,
+            modelUsed = "${transcribeOutput.modelUsed} -> ${graphOutput.modelUsed}",
+            extractedWikiLinks = links,
+            debugDetails = buildString {
+                appendLine("=== Stage 1: Speech Transcription ===")
+                appendLine(transcribeOutput.debugDetails)
+                appendLine()
+                appendLine("=== Stage 2: DMN Graph Synthesis ===")
+                append(graphOutput.debugDetails)
+            }.trim()
+        )
     }
 
     suspend fun processTextToDmnMarkdown(
@@ -308,7 +430,8 @@ class GeminiDmnService(private val context: Context) {
         onStageChanged: suspend (stage: String) -> Unit,
         onStatusDetail: (suspend (String) -> Unit)? = null,
         onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null,
-        retryControl: RetryControlChannel? = null
+        retryControl: RetryControlChannel? = null,
+        isVoiceTranscript: Boolean = false
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         require(cleanKey.isNotBlank()) { "Google AI Studio API key is missing." }
@@ -316,7 +439,11 @@ class GeminiDmnService(private val context: Context) {
         val cleanModel = modelId.trim().ifBlank { "gemini-3.5-flash" }
 
         onStageChanged("SYNTHESIZING")
-        val prompt = buildTextDmnPrompt(rawText, existingNodes, timestampStr)
+        val prompt = if (isVoiceTranscript) {
+            buildVoiceTranscriptToDmnPrompt(rawText, existingNodes, timestampStr)
+        } else {
+            buildTextDmnPrompt(rawText, existingNodes, timestampStr)
+        }
         val callOutput = callGenerateContent(
             apiKey = cleanKey,
             initialModelId = cleanModel,
@@ -592,6 +719,41 @@ class GeminiDmnService(private val context: Context) {
         val debugDetails: String
     )
 
+    private suspend fun callTranscribeFileContent(
+        apiKey: String,
+        initialTranscribeModelId: String,
+        fileUri: String,
+        mimeType: String,
+        onStatusDetail: (suspend (String) -> Unit)? = null,
+        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null,
+        retryControl: RetryControlChannel? = null
+    ): GenerateCallOutput {
+        val partsArray = JSONArray().put(
+            JSONObject().put(
+                "file_data",
+                JSONObject()
+                    .put("mime_type", mimeType)
+                    .put("file_uri", fileUri)
+            )
+        )
+        val payloadJson = JSONObject().put(
+            "contents",
+            JSONArray().put(JSONObject().put("parts", partsArray))
+        ).toString()
+
+        return executeGenerateWithRetry(
+            apiKey = apiKey,
+            initialModelId = initialTranscribeModelId.trim().ifBlank { DEFAULT_TRANSCRIBE_MODEL },
+            stepId = "transcribe",
+            actionLabel = "transcription",
+            inputSummary = "$mimeType ($fileUri)",
+            payloadJson = payloadJson,
+            onStatusDetail = onStatusDetail,
+            onStepUpdate = onStepUpdate,
+            retryControl = retryControl
+        )
+    }
+
     private suspend fun callGenerateContent(
         apiKey: String,
         initialModelId: String,
@@ -628,7 +790,30 @@ class GeminiDmnService(private val context: Context) {
             )
         }
 
-        val payloadJson = payload.toString()
+        return executeGenerateWithRetry(
+            apiKey = apiKey,
+            initialModelId = initialModelId.trim().ifBlank { "gemini-3.5-flash" },
+            stepId = "generate",
+            actionLabel = "synthesis",
+            inputSummary = "${mimeType ?: "text/plain"}${if (!fileUri.isNullOrBlank()) " ($fileUri)" else ""}",
+            payloadJson = payload.toString(),
+            onStatusDetail = onStatusDetail,
+            onStepUpdate = onStepUpdate,
+            retryControl = retryControl
+        )
+    }
+
+    private suspend fun executeGenerateWithRetry(
+        apiKey: String,
+        initialModelId: String,
+        stepId: String,
+        actionLabel: String,
+        inputSummary: String,
+        payloadJson: String,
+        onStatusDetail: (suspend (String) -> Unit)? = null,
+        onStepUpdate: (suspend (GeminiStepUpdate) -> Unit)? = null,
+        retryControl: RetryControlChannel? = null
+    ): GenerateCallOutput {
         var activeModel = initialModelId.trim().ifBlank { "gemini-3.5-flash" }
         val startMs = System.currentTimeMillis()
         var attempt = 0
@@ -647,17 +832,17 @@ class GeminiDmnService(private val context: Context) {
             val endpointUrl = "$BASE_URL/v1beta/models/$activeModel:generateContent"
             val reqSummary = buildString {
                 appendLine("POST $endpointUrl")
-                appendLine("Model: $activeModel | Attempt: #$attempt | Temperature: 0.2")
-                appendLine("Input: ${mimeType ?: "text/plain"}${if (!fileUri.isNullOrBlank()) " ($fileUri)" else ""}")
+                appendLine("Model: $activeModel | Attempt: #$attempt | Stage: $actionLabel")
+                appendLine("Input: $inputSummary")
                 append("JSON Payload Size: ${payloadJson.length} chars")
             }
 
             onStepUpdate?.invoke(
                 GeminiStepUpdate(
-                    stepId = "generate",
+                    stepId = stepId,
                     apiCall = "POST $endpointUrl",
                     statusText = if (attempt == 1) {
-                        "Sending synthesis request to $activeModel (${payloadJson.length} chars)..."
+                        "Sending $actionLabel request to $activeModel (${payloadJson.length} chars)..."
                     } else {
                         "Attempt #$attempt in flight to $activeModel..."
                     },
@@ -667,7 +852,7 @@ class GeminiDmnService(private val context: Context) {
                     modelId = activeModel,
                     requestSummary = reqSummary,
                     responsePayload = lastResponsePayload,
-                    historyEvent = "Attempt #$attempt started -> $activeModel"
+                    historyEvent = "Attempt #$attempt ($actionLabel) started -> $activeModel"
                 )
             )
 
@@ -721,7 +906,7 @@ class GeminiDmnService(private val context: Context) {
                             val attemptsNote = if (attempt > 1) " (failed after $attempt attempts over ${elapsedSec}s)" else ""
                             val hint = when {
                                 response.code == 503 || response.code == 429 ->
-                                    "\nTip: Try gemini-3.5-flash or gemini-3.5-flash-lite, or tap Load My Key's Models in Sync."
+                                    "\nTip: Try gemini-3.5-flash, gemini-3.5-flash-lite, or gemini-3.5-transcribe, or tap Load My Key's Models in Sync."
                                 details.contains("no longer available", ignoreCase = true) ->
                                     "\nTip: Switch to gemini-3.5-flash, gemini-3.8-flash, or gemini-3.5-flash-lite in Sync."
                                 else -> ""
@@ -733,15 +918,14 @@ class GeminiDmnService(private val context: Context) {
                                 appendLine("HTTP Status: ${response.code} ${response.message}")
                                 appendLine("Attempts: $attempt")
                                 appendLine("Elapsed: ${elapsedSec}s")
-                                appendLine("Input Type: ${mimeType ?: "text/plain"}")
-                                if (!fileUri.isNullOrBlank()) appendLine("Attached File URI: $fileUri")
+                                appendLine("Input: $inputSummary")
                                 appendLine("Payload Size: ${payloadJson.length} chars")
                                 appendLine("Response Body:")
                                 append(bodyStr.take(4000).ifBlank { "(empty)" })
                             }
                             onStepUpdate?.invoke(
                                 GeminiStepUpdate(
-                                    stepId = "generate",
+                                    stepId = stepId,
                                     apiCall = "POST $endpointUrl",
                                     statusText = "Failed (HTTP ${response.code}) after $attempt attempt(s)",
                                     stepStatus = "FAILED",
@@ -754,7 +938,7 @@ class GeminiDmnService(private val context: Context) {
                                 )
                             )
                             throw GeminiApiException(
-                                message = "Gemini generation error$attemptsNote — $details$hint",
+                                message = "Gemini $actionLabel error$attemptsNote — $details$hint",
                                 debugDetails = debugReport
                             )
                         }
@@ -815,7 +999,7 @@ class GeminiDmnService(private val context: Context) {
                             appendLine("Attempts: $attempt")
                             appendLine("Duration: ${elapsedMs / 1000.0}s")
                             appendLine("Finish Reason: ${finishReason.ifBlank { "STOP" }}")
-                            appendLine("Input Type: ${mimeType ?: "text/plain"}")
+                            appendLine("Input: $inputSummary")
                             if (usage != null) {
                                 appendLine(
                                     "Tokens — prompt=${usage.optInt("promptTokenCount")}, " +
@@ -827,9 +1011,9 @@ class GeminiDmnService(private val context: Context) {
                         }
                         onStepUpdate?.invoke(
                             GeminiStepUpdate(
-                                stepId = "generate",
+                                stepId = stepId,
                                 apiCall = "POST $endpointUrl",
-                                statusText = "HTTP ${response.code} OK (${text.length} chars generated via $activeModel)",
+                                statusText = "HTTP ${response.code} OK (${text.length} chars via $activeModel)",
                                 stepStatus = "COMPLETED",
                                 attemptNumber = attempt,
                                 modelId = activeModel,
@@ -881,7 +1065,7 @@ class GeminiDmnService(private val context: Context) {
                         }
                         onStepUpdate?.invoke(
                             GeminiStepUpdate(
-                                stepId = "generate",
+                                stepId = stepId,
                                 apiCall = "POST $endpointUrl",
                                 statusText = "Connection failed after $attempt attempt(s)",
                                 stepStatus = "FAILED",
@@ -907,7 +1091,7 @@ class GeminiDmnService(private val context: Context) {
                 onStatusDetail?.invoke(msg)
                 onStepUpdate?.invoke(
                     GeminiStepUpdate(
-                        stepId = "generate",
+                        stepId = stepId,
                         apiCall = "POST $endpointUrl",
                         statusText = msg,
                         stepStatus = "RETRYING",
@@ -929,6 +1113,7 @@ class GeminiDmnService(private val context: Context) {
             }
         }
     }
+
 
     private fun deleteRemoteFileQuietly(apiKey: String, fileName: String) {
         runCatching {
@@ -1151,6 +1336,72 @@ Analyze the user's pasted transcript or written note above and output a structur
 
 ### Captured Thought (Graph-Linked)
 [Graph-linked prose preserving the full depth of the user's input with natural inline [[WikiLinks]]...]
+        """.trimIndent()
+    }
+
+    fun buildVoiceTranscriptToDmnPrompt(
+        rawTranscript: String,
+        existingNodes: List<String>,
+        timestampStr: String
+    ): String {
+        val nodesContext = if (existingNodes.isNotEmpty()) {
+            existingNodes.take(500).joinToString(", ") { "[[$it]]" }
+        } else {
+            "None yet (propose new atomic [[Concept]] links freely)"
+        }
+
+        return """
+You are an executive Default Mode Network (DMN) cognitive synthesizer and personal knowledge graph architect for an Obsidian vault.
+
+### EXISTING KNOWLEDGE GRAPH NODES IN VAULT:
+$nodesContext
+
+### RAW VOICE TRANSCRIPT (Produced by Speech-to-Text):
+\"\"\"
+$rawTranscript
+\"\"\"
+
+### STRICT FORMATTING RULE:
+- Do NOT use any emojis anywhere in your response (zero icons in headings, bullets, tags, or prose). Maintain a crisp, analytical, professional tone.
+
+### YOUR TASK:
+Transform the raw spoken transcript above into a clean, graph-linked Obsidian Markdown DMN session entry:
+
+1. **PART 1: Rambler-Grade Clean Prose (`### Stream of Consciousness (Cleaned)`)**
+   - Strip filler vocalizations ("um", "uh", "er", "like", "you know"), stutters, false starts, accidental repetitions, and spoken self-corrections (apply corrections seamlessly).
+   - Preserve the speaker's exact first-person ("I") voice, ideas, reasoning, and full substantive detail in logical paragraphs without summarizing away substance.
+   - **Bi-Directional Graph Linking:** Whenever a concept, person, project, recurring problem, or mental model matches an item in `EXISTING KNOWLEDGE GRAPH NODES` (or warrants a new evergreen atomic topic node), naturally wrap it in Obsidian WikiLinks like `[[Concept Name]]` directly inline.
+
+2. **PART 2: DMN Cognitive Synthesis (`### DMN Synthesis & Graph Connections`)**
+   Structure the deeper synthesis into four subsections:
+   - **Core Realizations & Insights:** Breakthrough ideas or underlying truths uncovered during this session (with inline `[[WikiLinks]]`).
+   - **Past Solutions & Recognized Patterns:** How today's thoughts connect to past habits, previous problems, or historical solutions.
+   - **Future Goals & Next Actions:** Concrete, actionable next steps formatted as Obsidian tasks (`- [ ] Task description`).
+   - **Suggested Graph Connections:** Explicitly list 3 to 6 `[[Node Name]]` hubs (existing or new) that this thought clusters around, and briefly state why they connect.
+
+3. **PART 3: Inline Metadata Tags**
+   - Provide a single line of relevant Obsidian tags at the top of the entry (e.g., `#dmn #voice #insight #architecture`).
+
+### OUTPUT FORMAT (Valid Markdown Only, No Code Fences, Strictly Zero Emojis):
+## DMN Session — $timestampStr
+**Tags:** #dmn [add 2-4 contextual #tags]
+**Linked Hubs:** [comma-separated list of top [[WikiLinks]] used]
+
+### DMN Synthesis & Graph Connections
+**Core Realizations & Insights**
+- ...
+
+**Past Solutions & Recognized Patterns**
+- ...
+
+**Future Goals & Next Actions**
+- [ ] ...
+
+**Suggested Graph Connections**
+- [[Node A]] <-> [[Node B]]: Explanation of connection...
+
+### Stream of Consciousness (Cleaned)
+[Full Rambler-cleaned first-person prose with natural inline [[WikiLinks]]...]
         """.trimIndent()
     }
 }

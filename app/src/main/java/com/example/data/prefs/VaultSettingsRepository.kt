@@ -30,6 +30,8 @@ data class VaultSettings(
     val vaultDisplayName: String = "",
     val geminiApiKey: String = "",
     val geminiModel: String = DEFAULT_GEMINI_MODEL,
+    val transcriptionModel: String = DEFAULT_TRANSCRIPTION_MODEL,
+    val liveTranscriptionModel: String = DEFAULT_LIVE_TRANSCRIPTION_MODEL,
     val autoProcessAudio: Boolean = true,
     val driveConnectedEmail: String? = null,
     val driveFolderId: String? = null,
@@ -48,6 +50,8 @@ data class VaultSettings(
 
     companion object {
         const val DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+        const val DEFAULT_TRANSCRIPTION_MODEL = "gemini-3.5-transcribe"
+        const val DEFAULT_LIVE_TRANSCRIPTION_MODEL = "gemini-3.5-transcribe-live"
         const val DEFAULT_AUDIO_RETENTION_DAYS = 0 // 0 = Keep Forever
     }
 }
@@ -59,6 +63,8 @@ class VaultSettingsRepository(private val context: Context) {
         val VAULT_DISPLAY_NAME = stringPreferencesKey("vault_display_name")
         val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
         val GEMINI_MODEL = stringPreferencesKey("gemini_model")
+        val TRANSCRIPTION_MODEL = stringPreferencesKey("transcription_model")
+        val LIVE_TRANSCRIPTION_MODEL = stringPreferencesKey("live_transcription_model")
         val AUTO_PROCESS_AUDIO = booleanPreferencesKey("auto_process_audio")
         val DRIVE_CONNECTED_EMAIL = stringPreferencesKey("drive_connected_email")
         val DRIVE_FOLDER_ID = stringPreferencesKey("drive_folder_id")
@@ -85,6 +91,10 @@ class VaultSettingsRepository(private val context: Context) {
             geminiApiKey = prefs[Keys.GEMINI_API_KEY] ?: "",
             geminiModel = prefs[Keys.GEMINI_MODEL]?.takeIf { it.isNotBlank() }
                 ?: VaultSettings.DEFAULT_GEMINI_MODEL,
+            transcriptionModel = prefs[Keys.TRANSCRIPTION_MODEL]?.takeIf { it.isNotBlank() }
+                ?: VaultSettings.DEFAULT_TRANSCRIPTION_MODEL,
+            liveTranscriptionModel = prefs[Keys.LIVE_TRANSCRIPTION_MODEL]?.takeIf { it.isNotBlank() }
+                ?: VaultSettings.DEFAULT_LIVE_TRANSCRIPTION_MODEL,
             autoProcessAudio = prefs[Keys.AUTO_PROCESS_AUDIO] ?: true,
             driveConnectedEmail = prefs[Keys.DRIVE_CONNECTED_EMAIL],
             driveFolderId = prefs[Keys.DRIVE_FOLDER_ID],
@@ -108,10 +118,23 @@ class VaultSettingsRepository(private val context: Context) {
         }
     }
 
-    suspend fun setGeminiConfig(apiKey: String, model: String = VaultSettings.DEFAULT_GEMINI_MODEL) {
+    suspend fun setGeminiConfig(
+        apiKey: String,
+        model: String = VaultSettings.DEFAULT_GEMINI_MODEL,
+        transcriptionModel: String? = null,
+        liveTranscriptionModel: String? = null
+    ) {
         context.vaultDataStore.edit {
             it[Keys.GEMINI_API_KEY] = apiKey.trim()
             it[Keys.GEMINI_MODEL] = model.trim().ifBlank { VaultSettings.DEFAULT_GEMINI_MODEL }
+            if (transcriptionModel != null) {
+                it[Keys.TRANSCRIPTION_MODEL] = transcriptionModel.trim()
+                    .ifBlank { VaultSettings.DEFAULT_TRANSCRIPTION_MODEL }
+            }
+            if (liveTranscriptionModel != null) {
+                it[Keys.LIVE_TRANSCRIPTION_MODEL] = liveTranscriptionModel.trim()
+                    .ifBlank { VaultSettings.DEFAULT_LIVE_TRANSCRIPTION_MODEL }
+            }
         }
     }
 

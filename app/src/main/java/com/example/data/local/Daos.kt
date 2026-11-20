@@ -28,6 +28,21 @@ interface ProcessingJobDao {
 }
 
 @Dao
+interface VoiceDraftDao {
+    @Query("SELECT * FROM voice_drafts ORDER BY updatedAtMs DESC")
+    fun observeAllDrafts(): Flow<List<VoiceDraftEntity>>
+
+    @Query("SELECT * FROM voice_drafts WHERE id = :id LIMIT 1")
+    suspend fun getDraftById(id: String): VoiceDraftEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertDraft(draft: VoiceDraftEntity)
+
+    @Query("DELETE FROM voice_drafts WHERE id = :id")
+    suspend fun deleteDraftById(id: String)
+}
+
+@Dao
 interface SyncRecordDao {
     @Query("SELECT * FROM sync_records ORDER BY relativePath ASC")
     fun observeAllRecords(): Flow<List<SyncRecordEntity>>

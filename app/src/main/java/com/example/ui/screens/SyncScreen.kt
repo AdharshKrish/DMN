@@ -104,8 +104,8 @@ import java.util.Locale
 fun SyncScreen(
     state: MainUiState,
     onPickVaultFolder: () -> Unit,
-    onSaveGeminiConfig: (apiKey: String, model: String) -> Unit,
-    onTestGeminiConnection: (apiKey: String, model: String) -> Unit,
+    onSaveGeminiConfig: (apiKey: String, model: String, transcriptionModel: String?, liveTranscriptionModel: String?) -> Unit,
+    onTestGeminiConnection: (apiKey: String, model: String, transcriptionModel: String?, liveTranscriptionModel: String?) -> Unit,
     onFetchAvailableModels: (apiKey: String) -> Unit,
     onAuthorizeDrive: (Activity) -> Unit,
     onRefreshDriveFolders: () -> Unit,
@@ -128,6 +128,12 @@ fun SyncScreen(
     }
     var modelDraft by remember(state.settings.geminiModel) {
         mutableStateOf(state.settings.geminiModel)
+    }
+    var transcribeModelDraft by remember(state.settings.transcriptionModel) {
+        mutableStateOf(state.settings.transcriptionModel)
+    }
+    var liveTranscribeModelDraft by remember(state.settings.liveTranscriptionModel) {
+        mutableStateOf(state.settings.liveTranscriptionModel)
     }
     var retentionDaysDraft by remember(state.settings.audioRetentionDays) {
         mutableStateOf(state.settings.audioRetentionDays.toString())
@@ -300,7 +306,7 @@ fun SyncScreen(
                     OutlinedTextField(
                         value = modelDraft,
                         onValueChange = { modelDraft = it },
-                        label = { Text("Gemini Model ID") },
+                        label = { Text("DMN Graph Model (Flash)") },
                         singleLine = true,
                         trailingIcon = {
                             if (modelDraft != VaultSettings.DEFAULT_GEMINI_MODEL) {
@@ -331,7 +337,7 @@ fun SyncScreen(
                             text = if (state.availableGeminiModels.isNotEmpty()) {
                                 "Key Models (${state.availableGeminiModels.size})"
                             } else {
-                                "Recommended Models"
+                                "Recommended Flash Models"
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -369,6 +375,46 @@ fun SyncScreen(
                         }
                     }
 
+                    OutlinedTextField(
+                        value = transcribeModelDraft,
+                        onValueChange = { transcribeModelDraft = it },
+                        label = { Text("Voice Transcription Model (Batch & Inbox)") },
+                        singleLine = true,
+                        trailingIcon = {
+                            if (transcribeModelDraft != VaultSettings.DEFAULT_TRANSCRIPTION_MODEL) {
+                                TextButton(onClick = { transcribeModelDraft = VaultSettings.DEFAULT_TRANSCRIPTION_MODEL }) {
+                                    Text("Reset")
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("gemini_transcribe_model_input")
+                    )
+
+                    OutlinedTextField(
+                        value = liveTranscribeModelDraft,
+                        onValueChange = { liveTranscribeModelDraft = it },
+                        label = { Text("Live Streaming Transcription Model") },
+                        singleLine = true,
+                        trailingIcon = {
+                            if (liveTranscribeModelDraft != VaultSettings.DEFAULT_LIVE_TRANSCRIPTION_MODEL) {
+                                TextButton(onClick = { liveTranscribeModelDraft = VaultSettings.DEFAULT_LIVE_TRANSCRIPTION_MODEL }) {
+                                    Text("Reset")
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("gemini_live_model_input")
+                    )
+
+                    Text(
+                        text = "Pipeline: Studio streams via Live model first, automatically falls back to batched Transcription model on high-demand errors, and sends confirmed transcripts to the Flash DMN Graph model.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
                     when (val test = state.geminiTestState) {
                         is GeminiTestState.Testing -> LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         is GeminiTestState.Success -> {
@@ -393,7 +439,14 @@ fun SyncScreen(
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         OutlinedButton(
-                            onClick = { onSaveGeminiConfig(apiKeyDraft, modelDraft) },
+                            onClick = {
+                                onSaveGeminiConfig(
+                                    apiKeyDraft,
+                                    modelDraft,
+                                    transcribeModelDraft,
+                                    liveTranscribeModelDraft
+                                )
+                            },
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("save_gemini_key_button")
@@ -401,7 +454,14 @@ fun SyncScreen(
                             Text("Save")
                         }
                         Button(
-                            onClick = { onTestGeminiConnection(apiKeyDraft, modelDraft) },
+                            onClick = {
+                                onTestGeminiConnection(
+                                    apiKeyDraft,
+                                    modelDraft,
+                                    transcribeModelDraft,
+                                    liveTranscribeModelDraft
+                                )
+                            },
                             enabled = apiKeyDraft.isNotBlank() && state.geminiTestState !is GeminiTestState.Testing,
                             modifier = Modifier
                                 .weight(1f)

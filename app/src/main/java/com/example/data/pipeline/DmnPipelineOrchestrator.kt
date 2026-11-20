@@ -418,31 +418,52 @@ class DmnPipelineOrchestrator(
 
             val existingNodes = vaultRepo.scanExistingGraphNodes(treeUri)
 
-            // 1. Process Audio Inbox Items
+            // 1. Process Audio Inbox Items (2-Stage: Dedicated Transcribe -> Flash DMN Graph)
             for (audio in audioTargets) {
                 val nowMs = System.currentTimeMillis()
                 val startModel = batchOverrideModel ?: settings.geminiModel
+                val transcribeModel = settings.transcriptionModel
+                val existingJob = jobDao.getJobByUri(audio.uri.toString())
+                val precomputed = existingJob?.precomputedTranscript?.takeIf { it.isNotBlank() }
                 val timeTag = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(nowMs))
                 try {
-                    updateJob(audio.uri.toString(), audio.name, audio.sizeBytes, JobStatus.UPLOADING, null, null, null, null, nowMs)
-                    _liveStatusMessage.value = "Uploading ${audio.name}..."
+                    updateJob(audio.uri.toString(), audio.name, audio.sizeBytes, if (precomputed != null) JobStatus.SYNTHESIZING else JobStatus.UPLOADING, null, null, null, null, nowMs)
+                    _liveStatusMessage.value = if (precomputed != null) {
+                        "Synthesizing confirmed transcript (${audio.name})..."
+                    } else {
+                        "Uploading ${audio.name} for $transcribeModel..."
+                    }
                     _activeProcessingProgress.value = ActiveProcessingProgress(
                         fileName = audio.name,
                         inputKind = "Voice Audio",
-                        modelId = startModel,
+                        modelId = if (precomputed != null) startModel else transcribeModel,
                         currentApiCall = "Local SAF Scan (${existingNodes.size} graph nodes indexed)",
-                        currentStatusText = "Preparing audio upload to Gemini Files API...",
+                        currentStatusText = if (precomputed != null) {
+                            "Using confirmed transcript -> Flash graph synthesis ($startModel)..."
+                        } else {
+                            "Preparing audio upload for $transcribeModel -> $startModel..."
+                        },
                         requestPayloadSummary = "Local File: ${audio.name} (${audio.sizeBytes / 1024} KB, ${audio.mimeType})",
-                        attemptHistory = listOf("[$timeTag] Indexed ${existingNodes.size} graph hub(s); starting pipeline with $startModel"),
-                        steps = listOf(
-                            PipelineStepProgress("scan_graph", "Index Knowledge Graph", "Loaded ${existingNodes.size} existing [[WikiLink]] hubs", StepStatus.COMPLETED),
-                            PipelineStepProgress("upload_start", "Initiate Resumable Upload", "POST /upload/v1beta/files (start)", StepStatus.PENDING),
-                            PipelineStepProgress("upload_bytes", "Stream Audio Payload", "Streaming ${audio.sizeBytes / 1024} KB (${audio.mimeType})", StepStatus.PENDING),
-                            PipelineStepProgress("file_active", "Index Audio Remotely", "Waiting for Gemini Files state=ACTIVE", StepStatus.PENDING),
-                            PipelineStepProgress("generate", "Gemini DMN Synthesis", "POST /v1beta/models/$startModel:generateContent", StepStatus.PENDING),
-                            PipelineStepProgress("cleanup_remote", "Clean Temporary Remote File", "DELETE /v1beta/files/{id}", StepStatus.PENDING),
-                            PipelineStepProgress("save_vault", "Save Daily Note & Archives", "Write 99_Audio_Archive, 98_Transcript_Archive (.md), 01_Daily_Notes", StepStatus.PENDING)
-                        ),
+                        attemptHistory = listOf("[$timeTag] Indexed ${existingNodes.size} graph hub(s); pipeline: $transcribeModel -> $startModel"),
+                        steps = if (precomputed != null) {
+                            listOf(
+                                PipelineStepProgress("scan_graph", "Index Knowledge Graph", "Loaded ${existingNodes.size} existing [[WikiLink]] hubs", StepStatus.COMPLETED),
+                                PipelineStepProgress("transcribe", "Confirmed Speech Transcript", "Loaded ${precomputed.length} chars from confirmed draft", StepStatus.COMPLETED),
+                                PipelineStepProgress("generate", "Flash DMN Graph Synthesis", "POST /v1beta/models/$startModel:generateContent", StepStatus.PENDING),
+                                PipelineStepProgress("save_vault", "Save Daily Note & Transcript .md", "Write 98_Transcript_Archive (.md) & 01_Daily_Notes, then clear temp audio", StepStatus.PENDING)
+                            )
+                        } else {
+                            listOf(
+                                PipelineStepProgress("scan_graph", "Index Knowledge Graph", "Loaded ${existingNodes.size} existing [[WikiLink]] hubs", StepStatus.COMPLETED),
+                                PipelineStepProgress("upload_start", "Initiate Resumable Upload", "POST /upload/v1beta/files (start)", StepStatus.PENDING),
+                                PipelineStepProgress("upload_bytes", "Stream Audio Payload", "Streaming ${audio.sizeBytes / 1024} KB (${audio.mimeType})", StepStatus.PENDING),
+                                PipelineStepProgress("file_active", "Index Audio Remotely", "Waiting for Gemini Files state=ACTIVE", StepStatus.PENDING),
+                                PipelineStepProgress("transcribe", "Voice Transcription ($transcribeModel)", "POST /v1beta/models/$transcribeModel:generateContent", StepStatus.PENDING),
+                                PipelineStepProgress("cleanup_remote", "Clean Temporary Remote Audio", "DELETE /v1beta/files/{id}", StepStatus.PENDING),
+                                PipelineStepProgress("generate", "Flash DMN Graph Synthesis ($startModel)", "POST /v1beta/models/$startModel:generateContent", StepStatus.PENDING),
+                                PipelineStepProgress("save_vault", "Save Daily Note & Transcript .md", "Write 98_Transcript_Archive (.md) & 01_Daily_Notes, then clear temp audio", StepStatus.PENDING)
+                            )
+                        },
                         startedAtMs = nowMs
                     )
 
@@ -470,23 +491,25 @@ class DmnPipelineOrchestrator(
                         onStepUpdate = { update ->
                             applyGeminiStepUpdate(update)
                         },
-                        retryControl = retryControl
+                        retryControl = retryControl,
+                        transcribeModelId = transcribeModel,
+                        precomputedTranscript = precomputed
                     )
 
                     applyVaultStep(
                         stepId = "save_vault",
                         apiCall = "SAF DocumentFile Write (Local ObsidianVault)",
-                        statusText = "Archiving audio, writing .md transcript & Daily Note...",
+                        statusText = "Writing .md transcript & Daily Note...",
                         status = StepStatus.IN_PROGRESS
                     )
 
-                    val archivedAudioName = vaultRepo.archiveProcessedAudio(
-                        treeUriString = treeUri,
-                        sourceUri = audio.uri,
-                        sourceName = audio.name
-                    ).getOrThrow()
-
-                    val transcriptFileName = "${archivedAudioName.substringBeforeLast('.')}.md"
+                    val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                    val stemWithStamp = if (Regex("""^\d{8}_\d{6}_.*""").matches(audio.name)) {
+                        audio.name.substringBeforeLast('.')
+                    } else {
+                        "${stamp}_${audio.name.substringBeforeLast('.')}"
+                    }
+                    val transcriptFileName = "$stemWithStamp.md"
                     val archivedTranscriptName = vaultRepo.archiveRawTranscript(
                         treeUriString = treeUri,
                         rawText = generation.rawTranscript,
@@ -497,14 +520,17 @@ class DmnPipelineOrchestrator(
                         treeUriString = treeUri,
                         dateStr = dateStr,
                         entryMarkdown = generation.markdown,
-                        archivedAudioName = archivedAudioName,
+                        archivedAudioName = null,
                         archivedTranscriptName = archivedTranscriptName
                     ).getOrThrow()
+
+                    // Remove temporary inbox audio ONLY after transcript & daily note are safely written
+                    vaultRepo.deleteInboxAudio(audio.uri)
 
                     applyVaultStep(
                         stepId = "save_vault",
                         apiCall = "Saved $dailyPath + $archivedTranscriptName",
-                        statusText = "Completed ($archivedTranscriptName & $dailyPath)",
+                        statusText = "Completed ($archivedTranscriptName & $dailyPath; temp audio cleared)",
                         status = StepStatus.COMPLETED
                     )
 
@@ -516,7 +542,7 @@ class DmnPipelineOrchestrator(
                         status = JobStatus.COMPLETED,
                         error = null,
                         outputNotePath = dailyPath,
-                        archivedAudioName = archivedAudioName,
+                        archivedAudioName = archivedTranscriptName,
                         linkedNodesCsv = linksCsv,
                         createdAtMs = nowMs
                     )
@@ -526,9 +552,8 @@ class DmnPipelineOrchestrator(
                             level = "SUCCESS",
                             message = "Transcribed ${audio.name} -> $dailyPath + $archivedTranscriptName (${generation.extractedWikiLinks.size} WikiLinks via ${generation.modelUsed})",
                             details = buildString {
-                                appendLine("Input Audio: ${audio.name} (${audio.sizeBytes} bytes, ${audio.mimeType})")
+                                appendLine("Input Audio: ${audio.name} (${audio.sizeBytes} bytes, ${audio.mimeType}) — cleared after safe transcription")
                                 appendLine("Daily Note: $dailyPath")
-                                appendLine("Archived Audio: ${ObsidianVaultRepository.DIR_AUDIO_ARCHIVE}/$archivedAudioName")
                                 appendLine("Archived Transcript: ${ObsidianVaultRepository.DIR_TRANSCRIPT_ARCHIVE}/$archivedTranscriptName")
                                 appendLine("WikiLinks (${generation.extractedWikiLinks.size}): $linksCsv")
                                 if (generation.debugDetails.isNotBlank()) {
@@ -596,6 +621,8 @@ class DmnPipelineOrchestrator(
 
                     val timeStr = SimpleDateFormat("hh:mm a", Locale.US).format(Date())
                     val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                    val isVoiceTranscript = textFile.name.contains("Voice_", ignoreCase = true) ||
+                        textFile.name.contains("_Voice", ignoreCase = true)
 
                     val generation = geminiService.processTextToDmnMarkdown(
                         apiKey = settings.geminiApiKey,
@@ -615,7 +642,8 @@ class DmnPipelineOrchestrator(
                         onStepUpdate = { update ->
                             applyGeminiStepUpdate(update)
                         },
-                        retryControl = retryControl
+                        retryControl = retryControl,
+                        isVoiceTranscript = isVoiceTranscript
                     )
 
                     applyVaultStep(
@@ -869,6 +897,7 @@ class DmnPipelineOrchestrator(
                 outputNotePath = outputNotePath ?: prev?.outputNotePath,
                 archivedAudioName = archivedAudioName ?: prev?.archivedAudioName,
                 linkedNodesCsv = linkedNodesCsv ?: prev?.linkedNodesCsv,
+                precomputedTranscript = prev?.precomputedTranscript,
                 createdAtMs = prev?.createdAtMs ?: createdAtMs,
                 updatedAtMs = System.currentTimeMillis()
             )

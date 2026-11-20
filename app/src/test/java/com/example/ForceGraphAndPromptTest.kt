@@ -2,15 +2,21 @@ package com.example
 
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.DmnAudioRecorder
+import com.example.audio.LiveTranscriptionSessionManager
+import com.example.audio.PcmAudioEncoder
 import com.example.data.drive.DriveSyncManifest
 import com.example.data.drive.GoogleDriveAuthManager
 import com.example.data.drive.GoogleDriveSyncService
 import com.example.data.drive.ManifestFileEntry
 import com.example.data.gemini.GeminiDmnService
+import com.example.data.gemini.GeminiLiveTranscribeClient
+import com.example.data.gemini.LiveServerEvent
 import com.example.data.gemini.RetryControlChannel
 import com.example.data.local.SyncRecordEntity
+import com.example.data.local.VoiceDraftEntity
 import com.example.data.prefs.SyncDirection
 import com.example.data.prefs.VaultSettings
+import java.io.File
 import com.example.data.vault.GraphEdge
 import com.example.data.vault.GraphNode
 import com.example.data.vault.NodeGroup
@@ -381,5 +387,115 @@ class ForceGraphAndPromptTest {
         channel.requestImmediateRetry()
         assertFalse(channel.hasPendingModel())
         assertTrue(channel.consumeImmediateRetryFlag())
+    }
+
+    @Test
+    fun `pcm audio encoder computes duration, builds valid WAV header, and slices PCM accurately`() {
+        assertEquals(0L, PcmAudioEncoder.computeDurationMs(0L))
+        assertEquals(1000L, PcmAudioEncoder.computeDurationMs(32_000L))
+        assertEquals(12_000L, PcmAudioEncoder.computeDurationMs(384_000L))
+
+        val header = PcmAudioEncoder.buildWavHeader(1600L)
+        assertEquals(44, header.size)
+        assertEquals("RIFF", String(header.copyOfRange(0, 4), Charsets.US_ASCII))
+        assertEquals("WAVE", String(header.copyOfRange(8, 12), Charsets.US_ASCII))
+        assertEquals("data", String(header.copyOfRange(36, 40), Charsets.US_ASCII))
+
+        val tempPcm = File.createTempFile("synapse_pcm_test", ".pcm")
+        try {
+            tempPcm.writeBytes(ByteArray(1000) { (it % 127).toByte() })
+            val wav = PcmAudioEncoder.readPcmSliceAsWavBytes(tempPcm, 100L, 500L)
+            assertEquals(44 + 400, wav.size)
+            assertEquals("RIFF", String(wav.copyOfRange(0, 4), Charsets.US_ASCII))
+            assertEquals(100.toByte(), wav[44])
+        } finally {
+            tempPcm.delete()
+        }
+    }
+
+    @Test
+    fun `gemini live transcribe client builds payloads and parses all server event types`() {
+        val setup = GeminiLiveTranscribeClient.buildSetupPayload("gemini-3.5-transcribe-live")
+        val setupJson = org.json.JSONObject(setup).getJSONObject("setup")
+        assertEquals("models/gemini-3.5-transcribe-live", setupJson.getString("model"))
+        assertTrue(setupJson.has("inputAudioTranscription"))
+
+        val chunk = GeminiLiveTranscribeClient.buildRealtimeAudioPayload("AAAA")
+        val chunkObj = org.json.JSONObject(chunk)
+            .getJSONObject("realtimeInput")
+            .getJSONArray("mediaChunks")
+            .getJSONObject(0)
+        assertEquals("audio/pcm;rate=16000", chunkObj.getString("mimeType"))
+        assertEquals("AAAA", chunkObj.getString("data"))
+
+        assertEquals(
+            LiveServerEvent.SetupComplete,
+            GeminiLiveTranscribeClient.parseLiveServerMessage("""{"setupComplete":{}}""")
+        )
+        assertEquals(
+            LiveServerEvent.FinalTranscript("Hello world"),
+            GeminiLiveTranscribeClient.parseLiveServerMessage("""{"serverContent":{"inputTranscription":{"text":"Hello world"}}}""")
+        )
+        assertEquals(
+            LiveServerEvent.InterimTranscript("Hello wor"),
+            GeminiLiveTranscribeClient.parseLiveServerMessage("""{"serverContent":{"interimInputTranscription":{"text":"Hello wor"}}}""")
+        )
+        val errEvent = GeminiLiveTranscribeClient.parseLiveServerMessage(
+            """{"error":{"code":503,"status":"UNAVAILABLE","message":"Model experiencing high demand"}}"""
+        )
+        assertTrue(errEvent is LiveServerEvent.ServerError)
+        assertTrue((errEvent as LiveServerEvent.ServerError).isHighDemand)
+        assertTrue(GeminiLiveTranscribeClient.isLikelyHighDemandError("RESOURCE_EXHAUSTED quota exceeded", httpCode = 429))
+    }
+
+    @Test
+    fun `live transcription transcript merger deduplicates seam overlaps cleanly`() {
+        assertEquals("Hello world", LiveTranscriptionSessionManager.mergeTranscriptText("", "Hello world"))
+        assertEquals(
+            "I was thinking about distributed systems and consensus protocols",
+            LiveTranscriptionSessionManager.mergeTranscriptText(
+                "I was thinking about distributed systems",
+                "distributed systems and consensus protocols"
+            )
+        )
+        assertEquals(
+            "First thought. Second thought.",
+            LiveTranscriptionSessionManager.mergeTranscriptText("First thought.", "Second thought.")
+        )
+    }
+
+    @Test
+    fun `voice transcript to dmn prompt injects graph nodes and enforces zero emojis`() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val service = GeminiDmnService(context)
+        val prompt = service.buildVoiceTranscriptToDmnPrompt(
+            rawTranscript = "I realized today that sleep impacts deep work.",
+            existingNodes = listOf("Deep Work", "Sleep Architecture"),
+            timestampStr = "05:30 PM"
+        )
+        assertTrue(prompt.contains("[[Deep Work]]"))
+        assertTrue(prompt.contains("[[Sleep Architecture]]"))
+        assertTrue(prompt.contains("I realized today that sleep impacts deep work."))
+        assertTrue(prompt.contains("## DMN Session — 05:30 PM"))
+        assertTrue(prompt.contains("### Stream of Consciousness (Cleaned)"))
+        assertTrue(prompt.contains("### DMN Synthesis & Graph Connections"))
+        assertTrue(prompt.contains("Do NOT use any emojis"))
+    }
+
+    @Test
+    fun `voice draft entity tracks untranscribed audio backup accurately`() {
+        val pendingDraft = VoiceDraftEntity(
+            id = "d1",
+            title = "Walk",
+            transcriptText = "Part one",
+            pcmFilePath = "/tmp/session.pcm",
+            durationMs = 20_000L,
+            totalPcmBytes = 640_000L,
+            transcribedByteOffset = 320_000L
+        )
+        assertEquals(320_000L, pendingDraft.untranscribedBytes)
+
+        val safeClearedDraft = pendingDraft.copy(totalPcmBytes = 0L, transcribedByteOffset = 0L)
+        assertEquals(0L, safeClearedDraft.untranscribedBytes)
     }
 }

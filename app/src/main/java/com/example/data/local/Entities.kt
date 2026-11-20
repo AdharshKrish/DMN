@@ -7,6 +7,7 @@ enum class JobStatus(val displayLabel: String) {
     QUEUED("Queued"),
     UPLOADING("Uploading Audio"),
     PROCESSING_REMOTE("Indexing Audio"),
+    TRANSCRIBING("Transcribing Speech"),
     SYNTHESIZING("Synthesizing Graph"),
     COMPLETED("Completed"),
     FAILED("Failed")
@@ -22,9 +23,27 @@ data class ProcessingJobEntity(
     val outputNotePath: String? = null,
     val archivedAudioName: String? = null,
     val linkedNodesCsv: String? = null,
+    val precomputedTranscript: String? = null,
     val createdAtMs: Long = System.currentTimeMillis(),
     val updatedAtMs: Long = System.currentTimeMillis()
 )
+
+@Entity(tableName = "voice_drafts")
+data class VoiceDraftEntity(
+    @PrimaryKey val id: String,
+    val title: String,
+    val transcriptText: String,
+    val pcmFilePath: String,
+    val durationMs: Long = 0L,
+    val totalPcmBytes: Long = 0L,
+    val transcribedByteOffset: Long = 0L,
+    val lastModeLabel: String = "Draft",
+    val createdAtMs: Long = System.currentTimeMillis(),
+    val updatedAtMs: Long = System.currentTimeMillis()
+) {
+    val untranscribedBytes: Long
+        get() = (totalPcmBytes - transcribedByteOffset).coerceAtLeast(0L)
+}
 
 @Entity(tableName = "sync_records")
 data class SyncRecordEntity(
