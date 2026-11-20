@@ -178,12 +178,12 @@ class GeminiLiveTranscribeClient(
         val handshakeDeferred = CompletableDeferred<Result<Unit>>()
 
         val listener = object : WebSocketListener() {
-            override fun onOpen(ws: WebSocket, response: Response) {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (closed.get()) {
-                    ws.close(1000, "Client closed")
+                    webSocket.close(1000, "Client closed")
                     return
                 }
-                val sent = ws.send(buildSetupPayload(liveModelId))
+                val sent = webSocket.send(buildSetupPayload(liveModelId))
                 if (!sent) {
                     val err = IllegalStateException("Failed sending live transcription setup frame.")
                     handshakeDeferred.complete(Result.failure(err))
@@ -191,7 +191,7 @@ class GeminiLiveTranscribeClient(
                 }
             }
 
-            override fun onMessage(ws: WebSocket, text: String) {
+            override fun onMessage(webSocket: WebSocket, text: String) {
                 handleIncomingPayload(
                     rawJson = text,
                     handshakeDeferred = handshakeDeferred,
@@ -201,7 +201,7 @@ class GeminiLiveTranscribeClient(
                 )
             }
 
-            override fun onMessage(ws: WebSocket, bytes: ByteString) {
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 // Gemini Live API frequently sends JSON payloads in binary WebSocket frames
                 handleIncomingPayload(
                     rawJson = bytes.utf8(),
@@ -212,8 +212,8 @@ class GeminiLiveTranscribeClient(
                 )
             }
 
-            override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                ws.close(code, reason)
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(code, reason)
                 if (!closed.getAndSet(true)) {
                     val cleanReason = reason.ifBlank { "WebSocket closed (code $code)" }
                     val isHighDemand = isLikelyHighDemandError(cleanReason, wsCode = code)
@@ -225,7 +225,7 @@ class GeminiLiveTranscribeClient(
                 }
             }
 
-            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (!closed.getAndSet(true)) {
                     val cleanReason = reason.ifBlank { "Live stream closed (code $code)" }
                     val isHighDemand = isLikelyHighDemandError(cleanReason, wsCode = code)
@@ -237,7 +237,7 @@ class GeminiLiveTranscribeClient(
                 }
             }
 
-            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (!closed.getAndSet(true)) {
                     val httpCode = response?.code
                     val bodySnippet = runCatching { response?.body?.string()?.take(240) }.getOrNull().orEmpty()
